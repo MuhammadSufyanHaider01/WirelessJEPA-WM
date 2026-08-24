@@ -1,0 +1,38 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Packaging and coverage
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+
+# Local experiment outputs and large generated artifacts
+artifacts/
+checkpoints/
+outputs/
+runs/
+wandb/
+data/rollouts/
+*.ckpt
+*.pth
+*.pt
+
+# Local environment configuration
+.env
+.env.*
+!.env.example
