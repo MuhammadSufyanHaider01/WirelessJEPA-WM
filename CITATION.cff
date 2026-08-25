@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: If you use our code or results, please cite our paper and consider giving this repo a ⭐
+authors:
+  - family-names: Kalapos
+    given-names: András
+  - family-names: Gyires-Tóth
+    given-names: Bálint
+title: 'CNN-JEPA: Self-Supervised Pretraining Convolutional Neural Networks Using Joint Embedding Predictive Architecture'
+version: 1.0.0
+doi: 10.1109/ICMLA61862.2024.00169
+date-released: '2024-07-28'
+preferred-citation:
+  authors:
+    - family-names: Kalapos
+      given-names: András
+    - family-names: Gyires-Tóth
+      given-names: Bálint
+  title: 'CNN-JEPA: Self-Supervised Pretraining Convolutional Neural Networks Using Joint Embedding Predictive Architecture'
+  doi: 10.1109/ICMLA61862.2024.00169
+  type: conference-paper
+  pages: 1111-1114
+  year: '2024'
+  collection-title: 2024 International Conference on Machine Learning and Applications (ICMLA)
+  conference: {}
+  publisher: {}

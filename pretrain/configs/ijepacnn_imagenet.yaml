@@ -1,0 +1,59 @@
+seed: 42
+
+name: "CNN-JEPA_{data_dataset_name}_{backbone_name}"
+artifacts_root: "artifacts/pretrain_lightly/ijepacnn"
+
+mask:
+  strategy: "mixed" # multi-block | random | mixed 
+  mutli_block_kwargs:
+    aspect_ratio: [0.75, 1.5]
+    enc_mask_scale: [1.0, 1.0]
+    min_keep: 5 # initially 10
+    num_enc_blocks: 1
+    num_pred_blocks: 4
+    pred_mask_scale: [0.15, 0.2]
+  mixed_mutli_block_ratio: 0.75
+
+mask_ratio: 0.6
+
+backbone:
+  name: "resnet50" 
+  pretrained_weights: null # "imagenet" / null 
+  kwargs: 
+    global_pool: '' # remove the final pooling layer
+predictor:
+  n_layers: 3
+  kernel_size: 3
+  dw_sep_conv: True
+use_projection_head: False
+data:
+  dataset_name: "imagenet-1k"
+  num_workers: 16
+
+trainer:
+  max_epochs: 101
+  devices: "auto"
+  accelerator: "gpu"
+  precision: "bf16"
+  # sync_batchnorm: True
+  accumulate_grad_batches: null # 4
+  overfit_batches: 0.0 # 1
+  # resume_from_checkpoint: ""
+
+optimizer:
+  batch_size: 128
+  lr: 0.01
+  weight_decay: 0.01
+  cosine_warmpup_sched: True
+  lr_warmup_epochs: 10
+  exclude_norm_and_bias_from_wd: False
+  wd_schedule: False
+
+
+wandb: true # set to false to disable wandb logging
+
+# disable hydra outputs
+hydra:
+  output_subdir: null
+  run:
+    dir: .
