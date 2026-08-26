@@ -1,2 +1,8 @@
 artifacts/*
 !artifacts/.gitkeep
+
+# Local datasets and generated HDF5 subsets
+/dataset/
+/datasets/
+/Dataset/
+/data/*.h5
