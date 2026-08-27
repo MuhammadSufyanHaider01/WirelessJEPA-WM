@@ -319,11 +319,12 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
 
     model = lightly_model(cfg)
 
+    logger_list = []
     if cfg.wandb:
-        wandb_logger = pl.loggers.WandbLogger(
+        logger_list.append(pl.loggers.WandbLogger(
             name=cfg.name, project="I-JEPA-CNN", save_dir="artifacts",
             group=cfg.get("wandb_group", None),
-        )
+        ))
         # wandb_logger.log_hyperparams(OmegaConf.to_container(cfg))
 
     root_dir = os.path.abspath(os.path.join(cfg.artifacts_root, cfg.name))
@@ -333,6 +334,30 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
     if _get_rank() == 0:
         os.makedirs(ckpt_dir, exist_ok=True)
     print("Checkpoint dir:", ckpt_dir, flush=True)
+
+    if cfg.get("tensorboard", True):
+        logger_list.append(
+            pl.loggers.TensorBoardLogger(
+                save_dir=ckpt_dir,
+                name="tensorboard",
+                version=0,
+                default_hp_metric=False,
+            )
+        )
+    if cfg.get("csv_logging", True):
+        logger_list.append(
+            pl.loggers.CSVLogger(
+                save_dir=ckpt_dir,
+                name="csv",
+                version=0,
+                flush_logs_every_n_steps=100,
+            )
+        )
+    for active_logger in logger_list:
+        log_dir = getattr(active_logger, "log_dir", None)
+        if log_dir is None:
+            log_dir = getattr(active_logger, "save_dir", None)
+        print(f"{active_logger.__class__.__name__}: {log_dir}", flush=True)
     
     checkpoint = pl.callbacks.ModelCheckpoint(
         dirpath=ckpt_dir,
@@ -359,7 +384,7 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
         strategy = pl.strategies.DDPStrategy(find_unused_parameters=False)
 
     trainer = pl.Trainer(
-        logger=[wandb_logger] if cfg.wandb else False, 
+        logger=logger_list if logger_list else False,
         callbacks=callbacks, 
         strategy=strategy, 
         num_nodes=os.environ.get("SLURM_NNODES") or 1, # if SLURM_NNODES is not set, we assume 1 node

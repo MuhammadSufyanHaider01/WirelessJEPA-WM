@@ -52,6 +52,10 @@ optimizer:
 # Enable explicitly with `wandb=true` after authenticating via `wandb login`.
 wandb: false
 
+# Persist all Lightning metrics locally for each run.
+tensorboard: true
+csv_logging: true
+
 hydra:
   output_subdir: null
   run:

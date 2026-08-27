@@ -46,7 +46,32 @@ sbatch wirelessjepa-smoke.slurm
 Do not submit full pretraining until the smoke job completes successfully for
 all four masks.
 
-## 4. Submit one full run
+## 4. Submit all four full runs together
+
+The array launcher starts four independent models concurrently (one model per
+masking strategy), keeping the paper comparisons valid:
+
+```bash
+sbatch wirelessjepa-pretrain-all.slurm
+```
+
+Each task writes Slurm stdout to
+`artifacts/slurm-wirelessjepa-all-<job>_<task>.out`. For every run,
+checkpoints and local metrics are stored under
+`artifacts/pretrain_lightly/ijepacnn_iqfm/<run-name>/version_<n>/`:
+
+- TensorBoard event files: `tensorboard/version_0/`
+- CSV metrics (training loss, validation loss, learning rate, weight decay,
+  and online linear-evaluation metrics): `csv/version_0/`
+- `last.ckpt` and the best checkpoint selected by `val_metrics/lin_top1`
+
+View metrics while jobs are running with `tensorboard --logdir artifacts` or
+inspect `metrics.csv` in each run's CSV directory.
+
+If GPUs are unavailable in the default partition, override it at submission
+time, for example: `sbatch --partition=gpu-h100 wirelessjepa-pretrain-all.slurm`.
+
+For a single full run, use:
 
 ```bash
 sbatch cnn-jepa.slurm ijepacnn_iqfm_random
