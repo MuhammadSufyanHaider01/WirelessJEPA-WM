@@ -13,3 +13,4 @@ __pycache__/
 .pytest_cache/
 wandb/
 slurm-*.out
+train_ijepacnn.log
