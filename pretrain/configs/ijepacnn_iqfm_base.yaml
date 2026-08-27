@@ -1,0 +1,58 @@
+seed: 42
+
+name: "WirelessJEPA_{mask_strategy}_{backbone_name}_predL{predictor_n_layers}K{predictor_kernel_size}_lr{optimizer_lr}_wd{optimizer_weight_decay}_bs{optimizer_batch_size}"
+artifacts_root: "artifacts/pretrain_lightly/ijepacnn"
+
+mask:
+  mutli_block_kwargs:
+    aspect_ratio: [0.75, 1.5]
+    enc_mask_scale: [1.0, 1.0]
+    min_keep: 3
+    num_enc_blocks: 1
+    num_pred_blocks: 4
+    pred_mask_scale: [0.15, 0.2]
+
+backbone:
+  name: "shufflenet_v2_x0_5_torchvision"
+  pretrained_weights: null
+  kwargs:
+    global_pool: ''
+
+predictor:
+  n_layers: 3
+  kernel_size: 3
+  dw_sep_conv: true
+
+use_projection_head: false
+
+data:
+  dataset_name: "iqfm"
+  task: "aoa"
+  num_workers: 12
+  train_path: "${oc.env:WIRELESSJEPA_TRAIN_H5,./data/iqfm-train.h5}"
+  val_path: "${oc.env:WIRELESSJEPA_VAL_H5,./data/iqfm-val-100.h5}"
+
+trainer:
+  max_epochs: 100
+  devices: "auto"
+  accelerator: "gpu"
+  precision: "bf16"
+  accumulate_grad_batches: null
+  overfit_batches: 0.0
+
+optimizer:
+  batch_size: 256
+  lr: 0.005
+  weight_decay: 0.005
+  cosine_warmpup_sched: true
+  lr_warmup_epochs: 0.0
+  exclude_norm_and_bias_from_wd: false
+  wd_schedule: false
+
+# Enable explicitly with `wandb=true` after authenticating via `wandb login`.
+wandb: false
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

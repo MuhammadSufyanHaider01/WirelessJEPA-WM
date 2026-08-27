@@ -95,6 +95,13 @@ class MultiBlockMask(object):
     def _sample_block_mask(self, b_size, acceptable_regions=None):
         h, w = b_size
 
+        if h * w <= self.min_keep:
+            raise ValueError(
+                "Multi-block target is too small for min_keep: "
+                f"block={(h, w)} has {h * w} patches, min_keep={self.min_keep}. "
+                "Use the paper patch geometry (64, 32) for IQFM or reduce min_keep."
+            )
+
         def constrain_mask(mask, tries=0):
             """ Helper to restrict given mask to a set of acceptable regions """
             N = max(int(len(acceptable_regions)-tries), 0)
@@ -124,7 +131,7 @@ class MultiBlockMask(object):
             # -- Constrain mask to a set of acceptable regions
             if acceptable_regions is not None:
                 constrain_mask(mask, tries)
-            mask = torch.nonzero(mask.flatten())
+            mask = torch.nonzero(mask.flatten(), as_tuple=False).flatten()
             # -- If mask too small try again
             valid_mask = len(mask) > self.min_keep
             if not valid_mask:
@@ -132,7 +139,6 @@ class MultiBlockMask(object):
                 if timeout == 0:
                     tries += 1
                     timeout = og_timeout
-        mask = mask.squeeze()
         # --
         mask_complement = torch.ones((self.height, self.width), dtype=torch.int32)
         mask_complement[top:top+h, left:left+w] = 0

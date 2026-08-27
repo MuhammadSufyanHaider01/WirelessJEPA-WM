@@ -194,8 +194,8 @@ class LightlyModel(pl.LightningModule):
             "imagenet-100": dict(root="./data/imagenet-100-train.h5"),
             "imagenet-1k": dict(root="./data/imagenet-train.h5"),
             "iqfm": dict(
-                root="./data/iqfm-train.h5",
-                inter_channel=self.cfg.mask.inter_channel,
+                root=self.cfg.data.get("train_path", "./data/iqfm-train.h5"),
+                task=self.cfg.data.get("task", "aoa"),
             )
         }
         val_dataset_kwargs = {
@@ -205,7 +205,10 @@ class LightlyModel(pl.LightningModule):
             "imagenette": dict(root="./data/imagenette", split='val'),
             "imagenet-100": dict(root="./data/imagenet-100-val.h5"),
             "imagenet-1k": dict(root="./data/imagenet-val.h5"),
-            "iqfm": dict(root="./data/iqfm-val-100.h5"),
+            "iqfm": dict(
+                root=self.cfg.data.get("val_path", "./data/iqfm-val-100.h5"),
+                task=self.cfg.data.get("task", "aoa"),
+            ),
         }
         input_sizes = {
             "cifar10": 32,

@@ -23,7 +23,6 @@
 ####### Set environment variables ###############
 source ~/software/init-conda
 conda activate jepa38
-export WANDB_API_KEY="bada5503078ed952509582876bc0cd850cae8532"
 cd /home/omar.mashaal1/JEPA3/CNN-JEPA/
 
 ####### Run your script #########################

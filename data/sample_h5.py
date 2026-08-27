@@ -1,3 +1,4 @@
+import argparse
 import h5py
 import numpy as np
 from pathlib import Path
@@ -102,13 +103,22 @@ def sample_aoa_per_class(src_path, dst_path, per_class=100, seed=42, allow_repla
 
         print(f"[OK] Wrote {selected_indices.size} samples to: {dst_path}")
 
-# Example
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Create a deterministic AoA-stratified IQFM subset.")
+    parser.add_argument("--src", default="./data/iqfm-val.h5")
+    parser.add_argument("--dst", default="./data/iqfm-val-100.h5")
+    parser.add_argument("--per-class", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--allow-replacement", action="store_true")
+    parser.add_argument("--block", type=int, default=65536)
+    args = parser.parse_args()
+
     sample_aoa_per_class(
-        src_path="./data/iqfm-val.h5",
-        dst_path="./data/iqfm-val-100.h5",
-        per_class=100,
-        seed=42,
-        allow_replacement=False,
-        block=65536,  # tune for memory / speed
+        src_path=args.src,
+        dst_path=args.dst,
+        per_class=args.per_class,
+        seed=args.seed,
+        allow_replacement=args.allow_replacement,
+        block=args.block,
     )

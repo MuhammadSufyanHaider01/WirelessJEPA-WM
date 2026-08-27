@@ -1,0 +1,13 @@
+defaults:
+  - ijepacnn_iqfm_base
+  - _self_
+
+mask:
+  strategy: "time"
+  patch_size: [256, 32]
+
+mask_ratio: 0.6
+
+optimizer:
+  lr: 0.01
+  weight_decay: 0.01

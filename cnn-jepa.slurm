@@ -1,23 +1,39 @@
 #!/bin/bash
-#### sbatch job-script.slurm ####
-####### Reserve computing resources #############
+# Submit one paper mask at a time, for example:
+#   sbatch cnn-jepa.slurm ijepacnn_iqfm_random
+# Hydra overrides may follow the config name, for example: wandb=true
+
+#SBATCH --job-name=wirelessjepa
+#SBATCH --partition=gpu-h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-### SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
+#SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --mem=32G
-#SBATCH --partition=gpu-h100
-#SBATCH --gres=gpu:2
-    
-####### Set environment variables ###############
-source ~/software/init-conda
-conda activate cnn-jepa
-export WANDB_API_KEY="bada5503078ed952509582876bc0cd850cae8532"
-cd ~/ucalgary/iqfm-jepa/CNN-JEPA
+#SBATCH --output=artifacts/slurm-%x-%j.out
 
-####### Run your script #########################
-# PYTHONPATH=. python pretrain/train_ijepacnn.py --config-name ijepacnn_imagenet100.yaml 
+set -eo pipefail
 
-# PYTHONPATH=. python pretrain/train_ijepacnn.py --config-name ijepacnn_iqfm_shufflenet.yaml
-PYTHONPATH=. python pretrain/train_ijepacnn.py --config-name ijepacnn_iqfm_random.yaml
+source "${HOME}/software/init-conda"
+conda activate wireless-jepa
+set -u
+
+cd "${SLURM_SUBMIT_DIR:?Submit this job from the WirelessJEPA repository root}"
+export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
+
+config_name="${1:-ijepacnn_iqfm_random}"
+if [ "$#" -gt 0 ]; then
+    shift
+fi
+
+case "${config_name}" in
+    ijepacnn_iqfm_random|ijepacnn_iqfm_antenna|ijepacnn_iqfm_time|ijepacnn_iqfm_multiblock)
+        ;;
+    *)
+        echo "Unsupported config: ${config_name}" >&2
+        exit 2
+        ;;
+esac
+
+srun python3 -u pretrain/train_ijepacnn.py --config-name "${config_name}" "$@"

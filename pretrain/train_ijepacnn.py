@@ -34,8 +34,7 @@ from pretrain.trainer_common import LightlyModelMomentum, main_pretrain
 import models.sparse_encoder as sparse_encoder
 
 from pretrain.online_classification_benchmark import OnlineLinearClassificationBenckmark
-from pretrain.ijepa_mask import MultiBlockMask
-import random
+from pretrain.iqfm_masks import WirelessMaskGenerator, masked_l2_loss, resize_mask
 
 # import models.X does more than just importing the `models` module!
 # It also replaces some convnext models in the `timm` model registry with a ConvNext implementation that supports sparsity.
@@ -102,7 +101,7 @@ class IJEPA_CNN(LightlyModelMomentum):
             pred_layers.append(nn.ReLU(inplace=True))
         self.predictor = nn.Sequential(*pred_layers)
 
-        self.criterion = F.smooth_l1_loss
+        self.criterion = masked_l2_loss
 
     def setup_transform(self):
         # self.transform = IJEPATransform(self.input_size) # RandomResizedCrop, RandomHorizontalFlip, ToTensor
@@ -120,42 +119,37 @@ class IJEPA_CNN(LightlyModelMomentum):
 
     def setup(self, stage: str) -> None:
         super().setup(stage)
-        if self.cfg.backbone.name.lower().startswith('resnet') or self.cfg.backbone.name.lower().startswith('wide_resnet'):
-            self.downsample_raito = (32, 32)
-        else:
-            self.downsample_raito = (self.backbone.get_downsample_ratio(), self.backbone.get_downsample_ratio())
-        
-        if self.cfg.data.dataset_name == "iqfm":
-            if self.cfg.mask.strategy == "column":
-                self.downsample_raito = (256, 32)  # for column masking, use (1, 16) grid
-            else:
-                # self.downsample_raito = (64, 128)
-                self.downsample_raito = (256, 32)
-                # self.downsample_raito = (64, 32)
+        self.setup_masking()
 
-        # if self.cfg.mask.strategy == "random":
-        self.fmap_h, self.fmap_w = self.input_size // self.downsample_raito[0], self.input_size // self.downsample_raito[1]
-        self.len_keep = round(self.fmap_h * self.fmap_w * (1 - self.cfg.mask_ratio))
-        # elif self.cfg.mask.strategy == "multi-block":
-        self.multi_block_mask = MultiBlockMask(
-            input_size=self.input_size,
-            patch_size=self.downsample_raito,
-            **self.cfg.mask.mutli_block_kwargs
+    def setup_masking(self):
+        """Initialize paper-faithful IQFM masks independently of dataset setup."""
+        if self.cfg.backbone.name.lower().startswith('resnet') or self.cfg.backbone.name.lower().startswith('wide_resnet'):
+            downsample_ratio = (32, 32)
+        else:
+            ratio = self.backbone.get_downsample_ratio()
+            downsample_ratio = (ratio, ratio)
+
+        self.latent_shape = (
+            self.input_size // downsample_ratio[0],
+            self.input_size // downsample_ratio[1],
         )
+        self.mask_generator = WirelessMaskGenerator(
+            input_size=(self.input_size, self.input_size),
+            strategy=self.cfg.mask.strategy,
+            patch_size=self.cfg.mask.patch_size,
+            mask_ratio=self.cfg.get("mask_ratio", None),
+            mask_ratio_choices=self.cfg.mask.get("mask_ratio_choices", None),
+            multi_block_kwargs=self.cfg.mask.get("mutli_block_kwargs", None),
+        )
+        self.fmap_h = self.mask_generator.height
+        self.fmap_w = self.mask_generator.width
 
     def get_views_to_log_from_batch(self, batch):
         inp_bchw = batch[0]
         context_mask_b1ff, target_mask_b1ff = self.mask(inp_bchw.shape[0], inp_bchw.device)  # (B, 1, f, f)
 
-        H, W = self.input_size, self.input_size
-        # Upsample masks to input size
-        _, _, h, w = context_mask_b1ff.shape
-
-        assert H % h == 0 and W % w == 0, f"Input size {(H, W)} not divisible by mask size {(h, w)}"
-        h_rep, w_rep = H // h, W // w
-
-        context_mask_b1hw = context_mask_b1ff.repeat_interleave(h_rep, 2).repeat_interleave(w_rep, 3)  # (B, 1, H, W)
-        target_mask_b1hw  =  target_mask_b1ff.repeat_interleave(h_rep, 2).repeat_interleave(w_rep, 3)  # (B, 1, H, W)
+        context_mask_b1hw = resize_mask(context_mask_b1ff, inp_bchw.shape[-2:])
+        target_mask_b1hw = resize_mask(target_mask_b1ff, inp_bchw.shape[-2:])
 
         context_bchw = inp_bchw * context_mask_b1hw
         target_bchw = inp_bchw * target_mask_b1hw
@@ -181,25 +175,7 @@ class IJEPA_CNN(LightlyModelMomentum):
     #     super().on_validation_epoch_end()
     
     def mask(self, B: int, device, generator=None):
-        if self.cfg.mask.strategy == "mixed":
-            if torch.rand(1) < self.cfg.mask.mixed_mutli_block_ratio:
-                strategy = "multi-block"
-            else:
-                strategy = "random"
-        else:
-            strategy = self.cfg.mask.strategy
-        if strategy == "random" or strategy == "column":
-            h, w = self.fmap_h, self.fmap_w
-            idx = torch.rand(B, h * w, generator=generator).argsort(dim=1)
-            idx = idx[:, :self.len_keep].to(device)  # (B, len_keep)
-            context_mask = torch.zeros(B, h * w, dtype=torch.bool, device=device).scatter_(dim=1, index=idx, value=True).view(B, 1, h, w)
-            target_mask = context_mask.logical_not()
-            return context_mask, target_mask   
-        elif strategy == "multi-block":
-            context_mask, target_mask = self.multi_block_mask(B)
-            context_mask = context_mask.unsqueeze(1).to(device, dtype=torch.bool)
-            target_mask = target_mask.unsqueeze(1).to(device, dtype=torch.bool)
-            return context_mask, target_mask
+        return self.mask_generator(B, device=device, generator=generator)
                
 
     def forward(self, x):
@@ -207,33 +183,13 @@ class IJEPA_CNN(LightlyModelMomentum):
         # step1. Mask
         context_mask_b1ff, target_mask_b1ff  = self.mask(inp_bchw.shape[0], inp_bchw.device)  # (B, 1, f, f)
 
-        # Upsample masks to match feature map size
-        if context_mask_b1ff.shape[2] < context_mask_b1ff.shape[3]:
-            context_mask_b1ff = context_mask_b1ff.repeat_interleave(context_mask_b1ff.shape[3] // context_mask_b1ff.shape[2], dim=2)
-            target_mask_b1ff = target_mask_b1ff.repeat_interleave(target_mask_b1ff.shape[3] // target_mask_b1ff.shape[2], dim=2)
-        else:
-            context_mask_b1ff = context_mask_b1ff.repeat_interleave(context_mask_b1ff.shape[2] // context_mask_b1ff.shape[3], dim=3)
-            target_mask_b1ff = target_mask_b1ff.repeat_interleave(target_mask_b1ff.shape[2] // target_mask_b1ff.shape[3], dim=3)
-
-
-        latent_size = 8
-        if context_mask_b1ff.shape[2] != latent_size or context_mask_b1ff.shape[3] != latent_size:
-            context_mask_b1ff = context_mask_b1ff.repeat_interleave(latent_size // context_mask_b1ff.shape[2], dim=2).repeat_interleave(latent_size // context_mask_b1ff.shape[3], dim=3)
-            target_mask_b1ff = target_mask_b1ff.repeat_interleave(latent_size // target_mask_b1ff.shape[2], dim=2).repeat_interleave(latent_size // target_mask_b1ff.shape[3], dim=3)
+        # Adapt each paper mask geometry to the encoder latent grid.
+        context_mask_b1ff = resize_mask(context_mask_b1ff, self.latent_shape)
+        target_mask_b1ff = resize_mask(target_mask_b1ff, self.latent_shape)
 
         sparse_encoder._cur_active = context_mask_b1ff    # (B, 1, f, f)
 
-        # Upsample masks to input size
-       
-        _, _, h, w = context_mask_b1ff.shape
-        H, W = self.input_size, self.input_size
-        if h == 0 or w == 0:
-            print(f"[ERROR] h or w is zero before assert! H={H}, W={W}, h={h}, w={w}")
-            raise ValueError(f"Invalid mask size: h={h}, w={w}")
-        assert H % h == 0 and W % w == 0, f"Input size {(H, W)} not divisible by mask size {(h, w)}"
-        h_rep, w_rep = H // h, W // w
-
-        active_b1hw = context_mask_b1ff.repeat_interleave(h_rep, 2).repeat_interleave(w_rep, 3)  # (B, 1, H, W)
+        active_b1hw = resize_mask(context_mask_b1ff, inp_bchw.shape[-2:])
 
         masked_bchw = inp_bchw * active_b1hw
         
@@ -244,6 +200,11 @@ class IJEPA_CNN(LightlyModelMomentum):
         if self.projection_head is not None:
             features_bcff = self.projection_head(features_bcff)
         
+        if features_bcff.shape[-2:] != context_mask_b1ff.shape[-2:]:
+            raise RuntimeError(
+                f"Backbone produced {features_bcff.shape[-2:]}, expected latent mask {context_mask_b1ff.shape[-2:]}"
+            )
+
         # step 4. Fill-in mask tokens
         mask_tokens = self.mask_token.expand_as(features_bcff) # expands singleton dimensions to match the shape of features_bcff
         # where context_mask_b1ff is True, use features_bcff, where it's False (i.e. where it masked out a patch) use mask_tokens
@@ -263,13 +224,7 @@ class IJEPA_CNN(LightlyModelMomentum):
         x = batch[0]
         p, _, target_mask_b1ff = self.forward(x)
         h = self.forward_momentum(x)
-        # Normalize in feature dimension separately for each patch
-        p = F.normalize(p, dim=1)
-        h = F.normalize(h, dim=1)
-        loss = F.smooth_l1_loss(p, h, reduction='none').sum(axis=1,keepdim=True) # (B, 1, H, W)
-        # loss = F.cosine_similarity(p, h, dim=1).unsqueeze(1)  # (B, 1, H, W)
-        neg_mask_b1ff = target_mask_b1ff
-        loss = loss.mul_(neg_mask_b1ff).sum() / (neg_mask_b1ff.sum() + 1e-8)  # loss only on masked patches
+        loss = self.criterion(p, h, target_mask_b1ff)
         self.log(f"{metric_label}/ijepa_loss", loss, on_epoch=True)
         return loss
     

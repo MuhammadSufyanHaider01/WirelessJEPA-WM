@@ -12,7 +12,6 @@
 ####### Set environment variables ###############
 source ~/software/init-conda
 conda activate cnn-jepa
-export WANDB_API_KEY="bada5503078ed952509582876bc0cd850cae8532"
 cd ~/ucalgary/iqfm-jepa/CNN-JEPA
 
 ####### Run your script #########################

@@ -1,0 +1,13 @@
+defaults:
+  - ijepacnn_iqfm_base
+  - _self_
+
+mask:
+  strategy: "antenna"
+  patch_size: [64, 256]
+  # The authors' row-mask notebook samples one of 1, 2, or 3 antennas.
+  mask_ratio_choices: [0.25, 0.5, 0.75]
+
+optimizer:
+  lr: 0.01
+  weight_decay: 0.01

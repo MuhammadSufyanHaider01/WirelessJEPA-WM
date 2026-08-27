@@ -1,0 +1,10 @@
+defaults:
+  - ijepacnn_iqfm_base
+  - _self_
+
+mask:
+  strategy: "multi-block"
+  patch_size: [64, 32]
+
+# Retained in metadata for comparison; multi-block uses pred_mask_scale.
+mask_ratio: 0.6

@@ -6,3 +6,10 @@ artifacts/*
 /datasets/
 /Dataset/
 /data/*.h5
+
+# Python and local run artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+wandb/
+slurm-*.out
