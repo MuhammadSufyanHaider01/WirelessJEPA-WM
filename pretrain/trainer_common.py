@@ -6,6 +6,7 @@
 
 import os
 import copy
+import glob
 import time
 from typing import Callable
 from omegaconf import DictConfig, OmegaConf
@@ -301,6 +302,41 @@ class LightlyModelMomentum(LightlyModel):
         return super().training_step(batch, batch_idx)
 
 
+def _resolve_resume_checkpoint(root_dir, cfg):
+    resume_checkpoint = cfg.get("resume_from_checkpoint", None)
+    if not resume_checkpoint:
+        resume_checkpoint = os.environ.get("WIRELESSJEPA_RESUME_CHECKPOINT")
+    if resume_checkpoint in (None, "", "null", "None"):
+        resume_checkpoint = None
+
+    auto_resume = os.environ.get("WIRELESSJEPA_AUTO_RESUME", "0").lower() in {
+        "1", "true", "yes", "on"
+    }
+    if resume_checkpoint is not None:
+        resume_checkpoint = os.path.abspath(os.path.expanduser(str(resume_checkpoint)))
+        if not os.path.isfile(resume_checkpoint):
+            raise FileNotFoundError(
+                f"Requested resume checkpoint does not exist: {resume_checkpoint}"
+            )
+    elif auto_resume:
+        candidates = []
+        for version_dir in glob.glob(os.path.join(root_dir, "version_*")):
+            last_checkpoint = os.path.join(version_dir, "last.ckpt")
+            if not os.path.isfile(last_checkpoint):
+                continue
+            try:
+                version_number = int(os.path.basename(version_dir).split("_", 1)[1])
+            except (IndexError, ValueError):
+                version_number = -1
+            candidates.append((version_number, os.path.getmtime(last_checkpoint), last_checkpoint))
+        if candidates:
+            # Prefer the newest version, then the newest checkpoint within it.
+            # This avoids accidentally resuming an older abandoned run when a
+            # later version was created deliberately.
+            resume_checkpoint = max(candidates)[2]
+    return resume_checkpoint
+
+
 def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
     print("Running on:", os.environ.get("HOSTNAME", "docker"), flush=True)
     os.system("nvidia-smi")
@@ -328,8 +364,12 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
         # wandb_logger.log_hyperparams(OmegaConf.to_container(cfg))
 
     root_dir = os.path.abspath(os.path.join(cfg.artifacts_root, cfg.name))
-    version = utils.get_next_version(root_dir)
-    ckpt_dir = os.path.join(root_dir, f"version_{version}")
+    resume_checkpoint = _resolve_resume_checkpoint(root_dir, cfg)
+    if resume_checkpoint is not None:
+        ckpt_dir = os.path.dirname(resume_checkpoint)
+        print(f"Resuming from checkpoint: {resume_checkpoint}", flush=True)
+    else:
+        ckpt_dir = os.path.join(root_dir, f"version_{utils.get_next_version(root_dir)}")
     time.sleep(3) # To allow for other ranks to get the version number right
     if _get_rank() == 0:
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -390,8 +430,19 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
         num_nodes=os.environ.get("SLURM_NNODES") or 1, # if SLURM_NNODES is not set, we assume 1 node
         **cfg.trainer,
     )
-    trainer.fit(model=model)
+    trainer.fit(model=model, ckpt_path=resume_checkpoint)
 
+
+    # A normal return from trainer.fit means that max_epochs was reached. The
+    # marker lets operators distinguish a completed run from a checkpoint that
+    # was produced only because Slurm stopped the job at its wall-time limit.
+    if _get_rank() == 0:
+        completion_marker = os.path.join(ckpt_dir, "pretrain_complete")
+        temporary_marker = f"{completion_marker}.tmp.{os.getpid()}"
+        with open(temporary_marker, "w", encoding="utf-8") as marker_file:
+            marker_file.write("completed\n")
+        os.replace(temporary_marker, completion_marker)
+        print(f"Pretraining complete; marker written to {completion_marker}", flush=True)
 
 if __name__ == "__main__":
     main_pretrain(LightlyModel)

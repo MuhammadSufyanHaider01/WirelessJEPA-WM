@@ -32,6 +32,10 @@ data:
   train_path: "${oc.env:WIRELESSJEPA_TRAIN_H5,./data/iqfm-train.h5}"
   val_path: "${oc.env:WIRELESSJEPA_VAL_H5,./data/iqfm-val-100.h5}"
 
+# Set manually for a one-off continuation. The Slurm launchers set the
+# environment-based auto-resume flag for chained 24-hour allocations.
+resume_from_checkpoint: null
+
 trainer:
   max_epochs: 100
   devices: "auto"

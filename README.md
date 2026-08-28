@@ -39,6 +39,19 @@ Baseline implementations of the following pretraining approaches are also provid
 - [Supervised](pretrain/train_supervised.py)
 
 
+## Resuming Slurm pretraining
+
+The GPU queues used by this project impose a 24-hour wall-time limit. Both
+Slurm launchers request a continuation job ten minutes before that limit and
+resume from the newest `last.ckpt` in the same run directory.
+
+For a single masking strategy:
+```bash
+sbatch --partition=gpu-h100 --qos=gpu-h100 cnn-jepa.slurm ijepacnn_iqfm_antenna
+```
+
+The continuation chain ends when `pretrain_complete` is written after `max_epochs`.
+
 ## Setup
 
 We recommend using the provided Docker container to run the code.
