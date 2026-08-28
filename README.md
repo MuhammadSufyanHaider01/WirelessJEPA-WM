@@ -1,4 +1,14 @@
-# CNN-JEPA: Self-Supervised Pretraining Convolutional Neural Networks Using Joint Embedding Predictive Architecture
+# WirelessJEPA
+
+WirelessJEPA is a research codebase for wireless representation learning and
+JEPA-based world-model extensions for HAP-IoT and RIS-assisted networks.
+
+The destination project’s architecture and research contract are documented in:
+
+- [Research overview](docs/JEPA_World_Model_Research_Overview.md)
+- [Architecture and implementation specification](docs/JEPA_World_Model_Architecture_Implementation.md)
+
+## CNN-JEPA: Self-Supervised Pretraining Convolutional Neural Networks Using Joint Embedding Predictive Architecture
 
 This repository is the official implementation of [*CNN-JEPA: Self-Supervised Pretraining Convolutional Neural Networks Using Joint Embedding Predictive Architecture*](https://arxiv.org/abs/2408.07514)
 

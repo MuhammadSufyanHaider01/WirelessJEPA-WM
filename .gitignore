@@ -1,5 +1,13 @@
 artifacts/*
 !artifacts/.gitkeep
+checkpoints/
+outputs/
+runs/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
 
 # Local datasets and generated HDF5 subsets
 /dataset/
@@ -11,6 +19,30 @@ artifacts/*
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 wandb/
 slurm-*.out
 train_ijepacnn.log
+
+# Virtual environments
+.venv/
+venv/
+
+# Packaging and coverage
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Additional generated model artifacts
+data/rollouts/
+*.ckpt
+*.pth
+*.pt
+
+# Local environment configuration
+.env
+.env.*
+!.env.example
