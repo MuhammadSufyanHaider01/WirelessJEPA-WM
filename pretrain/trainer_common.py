@@ -404,8 +404,12 @@ def main_pretrain(cfg: DictConfig, lightly_model: LightlyModel):
         save_last=True,
         save_on_train_epoch_end=False,
         save_top_k=1, # doesn't work with DDP
-        monitor="val_metrics/lin_top1",
-        mode="max",
+        # The online linear benchmark runs only every fifth epoch, so
+        # val_metrics/lin_top1 is absent on the other validation passes.
+        # Monitor the JEPA validation loss instead; it is logged every epoch
+        # and keeps resumed jobs from failing at ModelCheckpoint.on_validation_end.
+        monitor="val_metrics/ijepa_loss",
+        mode="min",
         # filename="best"
     )
     progress_bar = TQDMProgressBar(refresh_rate=100)  # print every 50 batches
