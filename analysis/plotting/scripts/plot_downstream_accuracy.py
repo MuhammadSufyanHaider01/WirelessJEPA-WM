@@ -87,20 +87,12 @@ def plot(values: dict[tuple[str, str], float], output_stem: Path) -> None:
             hatch=HATCHES[index],
             alpha=0.92,
         )
-        ax.bar_label(
-            bars,
-            labels=[f"{accuracy:.1f}%" for accuracy in accuracies],
-            padding=3,
-            fontsize=7.5,
-            color="#202020",
-            fontweight="semibold",
-        )
 
     ax.set_title("WirelessJEPA Masking Ablation — 500-shot Linear Probe", weight="bold", pad=18)
     ax.set_ylabel("Accuracy (%)")
     ax.set_xlabel("Downstream task")
     ax.set_xticks(x, [TASK_LABELS[task] for task in TASK_ORDER])
-    ax.set_ylim(0, 112)
+    ax.set_ylim(0, 105)
     ax.set_yticks(np.arange(0, 101, 10))
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.set_axisbelow(True)
