@@ -35,7 +35,10 @@ TASK_LABELS = {
     "rml": "RML modulation",
     "radar": "Radar",
 }
-COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756"]
+# A high-contrast, colorblind-friendly palette; hatches provide a second
+# visual encoding so the mask identity remains clear in print/grayscale.
+COLORS = ["#3B6EA8", "#D95F02", "#2E8B57", "#756BB1"]
+HATCHES = ["///", "xx", "...", "++"]
 
 
 def load_linear_top1(results_root: Path) -> dict[tuple[str, str], float]:
@@ -70,7 +73,7 @@ def plot(values: dict[tuple[str, str], float], output_stem: Path) -> None:
     x = np.arange(len(TASK_ORDER))
     width = 0.19
 
-    fig, ax = plt.subplots(figsize=(12, 6.8), dpi=180)
+    fig, ax = plt.subplots(figsize=(12.5, 7.2), dpi=180)
     for index, mask in enumerate(MASK_ORDER):
         accuracies = [values[(mask, task)] for task in TASK_ORDER]
         bars = ax.bar(
@@ -79,29 +82,36 @@ def plot(values: dict[tuple[str, str], float], output_stem: Path) -> None:
             width,
             label=MASK_LABELS[mask],
             color=COLORS[index],
-            edgecolor="white",
-            linewidth=0.7,
+            edgecolor="#303030",
+            linewidth=0.8,
+            hatch=HATCHES[index],
+            alpha=0.92,
         )
-        for bar, accuracy in zip(bars, accuracies):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                accuracy + 1.2,
-                f"{accuracy:.1f}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-                rotation=90,
-            )
+        ax.bar_label(
+            bars,
+            labels=[f"{accuracy:.1f}%" for accuracy in accuracies],
+            padding=3,
+            fontsize=7.5,
+            color="#202020",
+            fontweight="semibold",
+        )
 
-    ax.set_title("WirelessJEPA Masking Ablation — 500-shot Linear Probe", weight="bold", pad=14)
+    ax.set_title("WirelessJEPA Masking Ablation — 500-shot Linear Probe", weight="bold", pad=18)
     ax.set_ylabel("Accuracy (%)")
     ax.set_xlabel("Downstream task")
     ax.set_xticks(x, [TASK_LABELS[task] for task in TASK_ORDER])
-    ax.set_ylim(0, 110)
+    ax.set_ylim(0, 112)
     ax.set_yticks(np.arange(0, 101, 10))
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.set_axisbelow(True)
-    ax.legend(ncol=4, frameon=False, loc="upper center", bbox_to_anchor=(0.5, 1.02))
+    ax.legend(
+        ncol=2,
+        frameon=True,
+        facecolor="white",
+        edgecolor="#D0D0D0",
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+    )
     ax.text(
         0,
         -0.19,

@@ -19,6 +19,8 @@ The script reads the completed downstream logs under
 - `figures/accuracy_500shots_bar.pdf`
 
 The chart shows final linear top-1 validation accuracy for each available
-masking strategy and downstream task. The current repository contains five
+masking strategy and downstream task. Each strategy is encoded with both a
+distinct color and hatch pattern so it remains readable in grayscale or print.
+The current repository contains five
 tasks (`aoa`, `mod`, `rf`, `rml`, and `radar`); it is a comparable local
 result, not a complete reproduction of the paper's five OOD Figure 3 tasks.
