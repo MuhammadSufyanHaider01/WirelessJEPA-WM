@@ -2,9 +2,9 @@
 """Plot frozen-encoder downstream accuracy by masking strategy.
 
 The script reads the ``Benchmark results`` lines emitted by
-``pretrain/eval_ijepacnn.py`` and writes grouped top-1 accuracy bars for
-every completed ``*_samples500`` run. By default it writes one figure for
-the linear probe and one for kNN.
+``pretrain/eval_ijepacnn.py`` and writes a linear-probe figure plus, by
+default, a two-panel linear-probe/kNN comparison for every completed
+``*_samples500`` run.
 """
 
 from __future__ import annotations
@@ -42,12 +42,7 @@ HATCHES = ["///", "xx", "...", "++"]
 
 
 def load_top1_metrics(results_root: Path) -> dict[str, dict[tuple[str, str], float]]:
-    """Return final linear and kNN top-1 accuracy in percent.
-
-    The evaluator stores probabilities in the final ``Benchmark results``
-    dictionary. Keeping both metrics in one parser ensures the two plots are
-    generated from exactly the same completed runs.
-    """
+    """Return final linear and kNN top-1 accuracy in percent."""
     values: dict[str, dict[tuple[str, str], float]] = {
         "linear": {},
         "knn": {},
@@ -79,19 +74,9 @@ def load_top1_metrics(results_root: Path) -> dict[str, dict[tuple[str, str], flo
     return values
 
 
-def plot(
-    values: dict[tuple[str, str], float],
-    output_stem: Path,
-    *,
-    title: str,
-    note: str,
-) -> None:
-    """Write a grouped-bar figure in PNG and PDF formats."""
-    output_stem.parent.mkdir(parents=True, exist_ok=True)
+def _draw_bars(ax: plt.Axes, values: dict[tuple[str, str], float]) -> None:
     x = np.arange(len(TASK_ORDER))
     width = 0.19
-
-    fig, ax = plt.subplots(figsize=(12.5, 7.2), dpi=180)
     for index, mask in enumerate(MASK_ORDER):
         accuracies = [values[(mask, task)] for task in TASK_ORDER]
         ax.bar(
@@ -105,15 +90,20 @@ def plot(
             hatch=HATCHES[index],
             alpha=0.92,
         )
-
-    ax.set_title(title, weight="bold", pad=18)
-    ax.set_ylabel("Accuracy (%)")
     ax.set_xlabel("Downstream task")
     ax.set_xticks(x, [TASK_LABELS[task] for task in TASK_ORDER])
     ax.set_ylim(0, 105)
     ax.set_yticks(np.arange(0, 101, 10))
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.set_axisbelow(True)
+
+
+def plot(values: dict[tuple[str, str], float], output_stem: Path) -> None:
+    """Write a standalone grouped-bar figure in PNG and PDF formats."""
+    output_stem.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(12.5, 7.2), dpi=180)
+    _draw_bars(ax, values)
+    ax.set_ylabel("Top-1 accuracy (%)")
     ax.legend(
         ncol=2,
         frameon=True,
@@ -122,62 +112,28 @@ def plot(
         loc="upper center",
         bbox_to_anchor=(0.5, 1.02),
     )
-    ax.text(
-        0,
-        -0.19,
-        note,
-        transform=ax.transAxes,
-        fontsize=8.5,
-        color="#555555",
-    )
-    fig.tight_layout(rect=(0, 0.04, 1, 0.96))
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(output_stem.with_suffix(".png"), bbox_inches="tight")
     fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
 
 
-
 def plot_comparison(
     metrics: dict[str, dict[tuple[str, str], float]],
     output_stem: Path,
-    *,
-    note: str,
 ) -> None:
     """Write one two-panel figure comparing linear probing and kNN."""
     output_stem.parent.mkdir(parents=True, exist_ok=True)
-    x = np.arange(len(TASK_ORDER))
-    width = 0.19
     fig, axes = plt.subplots(1, 2, figsize=(15.0, 6.8), sharey=True, dpi=180)
 
-    for panel_index, (ax, metric, panel_title) in enumerate(
-        zip(
-            axes,
-            ("linear", "knn"),
-            ("(a) Linear probing", "(b) kNN"),
-        )
-    ):
-        for index, mask in enumerate(MASK_ORDER):
-            accuracies = [metrics[metric][(mask, task)] for task in TASK_ORDER]
-            ax.bar(
-                x + (index - 1.5) * width,
-                accuracies,
-                width,
-                label=MASK_LABELS[mask] if panel_index == 0 else "_nolegend_",
-                color=COLORS[index],
-                edgecolor="#303030",
-                linewidth=0.8,
-                hatch=HATCHES[index],
-                alpha=0.92,
-            )
-        ax.set_title(panel_title, weight="bold", pad=12)
-        ax.set_xlabel("Downstream task")
-        ax.set_xticks(x, [TASK_LABELS[task] for task in TASK_ORDER])
-        ax.set_ylim(0, 105)
-        ax.set_yticks(np.arange(0, 101, 10))
-        ax.grid(axis="y", linestyle="--", alpha=0.35)
-        ax.set_axisbelow(True)
+    for panel_index, (ax, metric) in enumerate(zip(axes, ("linear", "knn"))):
+        _draw_bars(ax, metrics[metric])
+        if panel_index == 0:
+            ax.set_ylabel("Top-1 accuracy (%)")
+        else:
+            ax.set_ylabel("")
+            ax.tick_params(labelleft=False)
 
-    axes[0].set_ylabel("Top-1 accuracy (%)")
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles,
@@ -187,15 +143,9 @@ def plot_comparison(
         facecolor="white",
         edgecolor="#D0D0D0",
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.965),
+        bbox_to_anchor=(0.5, 0.98),
     )
-    fig.suptitle(
-        "WirelessJEPA Downstream Evaluation — Linear Probe vs kNN",
-        weight="bold",
-        y=1.02,
-    )
-    fig.text(0.5, 0.015, note, ha="center", fontsize=8.5, color="#555555")
-    fig.tight_layout(rect=(0, 0.055, 1, 0.90))
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(output_stem.with_suffix(".png"), bbox_inches="tight")
     fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
@@ -217,52 +167,26 @@ def main() -> None:
         help="Linear-probe output path without an extension; PNG and PDF are written.",
     )
     parser.add_argument(
-        "--knn-output-stem",
-        type=Path,
-        default=repo_root / "analysis/plotting/figures/accuracy_500shots_knn_bar",
-        help="kNN output path without an extension; PNG and PDF are written.",
-    )
-    parser.add_argument(
-        "--metric",
-        choices=("linear", "knn", "both"),
-        default="both",
-        help="Which metric to plot (default: both).",
-    )
-    parser.add_argument(
         "--comparison-output-stem",
         type=Path,
         default=repo_root / "analysis/plotting/figures/accuracy_500shots_linear_knn",
-        help="Combined two-panel output path without an extension; written when --metric=both.",
+        help="Combined output path without an extension; PNG and PDF are written.",
+    )
+    parser.add_argument(
+        "--metric",
+        choices=("linear", "both"),
+        default="both",
+        help="Write the standalone linear figure or both retained figures (default: both).",
     )
     args = parser.parse_args()
     metrics = load_top1_metrics(args.results_root)
-    note = (
-        "Top-1 validation accuracy; AoA uses 80/20 train/validation because "
-        "the dataset has 100 samples/class."
-    )
 
-    if args.metric in ("linear", "both"):
-        plot(
-            metrics["linear"],
-            args.output_stem,
-            title="WirelessJEPA Masking Ablation — 500-shot Linear Probe",
-            note=f"Linear {note[0].lower() + note[1:]}",
-        )
-        print(f"Wrote {args.output_stem.with_suffix('.png')}")
-        print(f"Wrote {args.output_stem.with_suffix('.pdf')}")
-
-    if args.metric in ("knn", "both"):
-        plot(
-            metrics["knn"],
-            args.knn_output_stem,
-            title="WirelessJEPA Masking Ablation — 500-shot kNN",
-            note=f"kNN {note[0].lower() + note[1:]}",
-        )
-        print(f"Wrote {args.knn_output_stem.with_suffix('.png')}")
-        print(f"Wrote {args.knn_output_stem.with_suffix('.pdf')}")
+    plot(metrics["linear"], args.output_stem)
+    print(f"Wrote {args.output_stem.with_suffix('.png')}")
+    print(f"Wrote {args.output_stem.with_suffix('.pdf')}")
 
     if args.metric == "both":
-        plot_comparison(metrics, args.comparison_output_stem, note=note)
+        plot_comparison(metrics, args.comparison_output_stem)
         print(f"Wrote {args.comparison_output_stem.with_suffix('.png')}")
         print(f"Wrote {args.comparison_output_stem.with_suffix('.pdf')}")
 
