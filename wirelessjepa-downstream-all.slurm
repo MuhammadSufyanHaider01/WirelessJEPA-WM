@@ -16,10 +16,13 @@
 #SBATCH --signal=B:USR1@600
 #SBATCH --output=artifacts/slurm-%x-%j.out
 
-set -euo pipefail
-
+# The site Conda activation hook references optional variables (including
+# MKL_INTERFACE_LAYER). Enable nounset only after the environment has been
+# initialized so an unset optional variable cannot abort the job at startup.
+set -eo pipefail
 source "${HOME}/software/init-conda"
 conda activate wireless-jepa
+set -u
 
 cd "${SLURM_SUBMIT_DIR:?Submit this job from the WirelessJEPA repository root}"
 export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
