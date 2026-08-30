@@ -28,7 +28,12 @@ def make_train_val_datasets(
     mode="per_class"  -> take `per_class_n` samples per class into train
     """
 
-    labels = np.array([y for _, y in base_ds])
+    # HDF5IQDataset already keeps labels in memory. Avoid iterating through
+    # every IQ sample just to construct stratification labels for large files.
+    if hasattr(base_ds, "labels"):
+        labels = base_ds.labels.detach().cpu().numpy()
+    else:
+        labels = np.array([y for _, y in base_ds])
     all_idx = np.arange(len(base_ds))
 
     if mode == "percentage":
@@ -78,6 +83,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint (.ckpt)')
     parser.add_argument('--task', type=str, choices=['rml', 'rf', 'deepbeam', 'aoa', 'mod','jamming','tpi','inter',"radar","craw"],
                         help='Predefined dataset task (rml, rf, deepbeam, aoa, mod)')
+    parser.add_argument('--data-path', type=str, default=None,
+                        help='Explicit downstream HDF5 path; overrides the legacy task mapping.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
 
     # NEW: choose per-class sample size; batch size is derived from this
@@ -106,7 +113,9 @@ def main():
 
     # ----- data path selection (unchanged) -----
     if args.task is not None:
-        if args.task == 'rml':
+        if args.data_path is not None:
+            data_path = args.data_path
+        elif args.task == 'rml':
             data_path = './data/rml2016.h5'
         elif args.task == 'rf':
             data_path = './data/RF_FingerPrinting.h5'
