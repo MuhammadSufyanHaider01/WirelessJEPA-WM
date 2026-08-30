@@ -2,14 +2,14 @@
 """Plot frozen-encoder downstream accuracy by masking strategy.
 
 The script reads the ``Benchmark results`` lines emitted by
-``pretrain/eval_ijepacnn.py`` and writes grouped linear-probe accuracy bars
-for every completed ``*_samples500`` run.
+``pretrain/eval_ijepacnn.py`` and writes grouped top-1 accuracy bars for
+every completed ``*_samples500`` run. By default it writes one figure for
+the linear probe and one for kNN.
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 import re
 from pathlib import Path
 
@@ -41,9 +41,17 @@ COLORS = ["#3B6EA8", "#D95F02", "#2E8B57", "#756BB1"]
 HATCHES = ["///", "xx", "...", "++"]
 
 
-def load_linear_top1(results_root: Path) -> dict[tuple[str, str], float]:
-    """Return final linear top-1 accuracy in percent for each mask/task pair."""
-    values: dict[tuple[str, str], float] = {}
+def load_top1_metrics(results_root: Path) -> dict[str, dict[tuple[str, str], float]]:
+    """Return final linear and kNN top-1 accuracy in percent.
+
+    The evaluator stores probabilities in the final ``Benchmark results``
+    dictionary. Keeping both metrics in one parser ensures the two plots are
+    generated from exactly the same completed runs.
+    """
+    values: dict[str, dict[tuple[str, str], float]] = {
+        "linear": {},
+        "knn": {},
+    }
     value_pattern = re.compile(r"'([^']+)': tensor\(([-+0-9.eE]+)")
     result_pattern = re.compile(r"Benchmark results: (\{.*\})")
 
@@ -59,16 +67,26 @@ def load_linear_top1(results_root: Path) -> dict[tuple[str, str], float]:
         except ValueError:
             continue
         if "lin_top1_final" in metrics:
-            values[(mask, task)] = 100.0 * metrics["lin_top1_final"]
+            values["linear"][(mask, task)] = 100.0 * metrics["lin_top1_final"]
+        if "knn_top1" in metrics:
+            values["knn"][(mask, task)] = 100.0 * metrics["knn_top1"]
 
     expected = [(mask, task) for mask in MASK_ORDER for task in TASK_ORDER]
-    missing = [pair for pair in expected if pair not in values]
-    if missing:
-        raise RuntimeError(f"Missing completed metrics: {missing}")
+    for metric, metric_values in values.items():
+        missing = [pair for pair in expected if pair not in metric_values]
+        if missing:
+            raise RuntimeError(f"Missing completed {metric} metrics: {missing}")
     return values
 
 
-def plot(values: dict[tuple[str, str], float], output_stem: Path) -> None:
+def plot(
+    values: dict[tuple[str, str], float],
+    output_stem: Path,
+    *,
+    title: str,
+    note: str,
+) -> None:
+    """Write a grouped-bar figure in PNG and PDF formats."""
     output_stem.parent.mkdir(parents=True, exist_ok=True)
     x = np.arange(len(TASK_ORDER))
     width = 0.19
@@ -76,7 +94,7 @@ def plot(values: dict[tuple[str, str], float], output_stem: Path) -> None:
     fig, ax = plt.subplots(figsize=(12.5, 7.2), dpi=180)
     for index, mask in enumerate(MASK_ORDER):
         accuracies = [values[(mask, task)] for task in TASK_ORDER]
-        bars = ax.bar(
+        ax.bar(
             x + (index - 1.5) * width,
             accuracies,
             width,
@@ -88,7 +106,7 @@ def plot(values: dict[tuple[str, str], float], output_stem: Path) -> None:
             alpha=0.92,
         )
 
-    ax.set_title("WirelessJEPA Masking Ablation — 500-shot Linear Probe", weight="bold", pad=18)
+    ax.set_title(title, weight="bold", pad=18)
     ax.set_ylabel("Accuracy (%)")
     ax.set_xlabel("Downstream task")
     ax.set_xticks(x, [TASK_LABELS[task] for task in TASK_ORDER])
@@ -107,7 +125,7 @@ def plot(values: dict[tuple[str, str], float], output_stem: Path) -> None:
     ax.text(
         0,
         -0.19,
-        "Linear top-1 validation accuracy; AoA uses 80/20 train/validation because the dataset has 100 samples/class.",
+        note,
         transform=ax.transAxes,
         fontsize=8.5,
         color="#555555",
@@ -131,13 +149,46 @@ def main() -> None:
         "--output-stem",
         type=Path,
         default=repo_root / "analysis/plotting/figures/accuracy_500shots_bar",
-        help="Output path without an extension; PNG and PDF are written.",
+        help="Linear-probe output path without an extension; PNG and PDF are written.",
+    )
+    parser.add_argument(
+        "--knn-output-stem",
+        type=Path,
+        default=repo_root / "analysis/plotting/figures/accuracy_500shots_knn_bar",
+        help="kNN output path without an extension; PNG and PDF are written.",
+    )
+    parser.add_argument(
+        "--metric",
+        choices=("linear", "knn", "both"),
+        default="both",
+        help="Which metric to plot (default: both).",
     )
     args = parser.parse_args()
-    values = load_linear_top1(args.results_root)
-    plot(values, args.output_stem)
-    print(f"Wrote {args.output_stem.with_suffix('.png')}")
-    print(f"Wrote {args.output_stem.with_suffix('.pdf')}")
+    metrics = load_top1_metrics(args.results_root)
+    note = (
+        "Top-1 validation accuracy; AoA uses 80/20 train/validation because "
+        "the dataset has 100 samples/class."
+    )
+
+    if args.metric in ("linear", "both"):
+        plot(
+            metrics["linear"],
+            args.output_stem,
+            title="WirelessJEPA Masking Ablation — 500-shot Linear Probe",
+            note=f"Linear {note[0].lower() + note[1:]}",
+        )
+        print(f"Wrote {args.output_stem.with_suffix('.png')}")
+        print(f"Wrote {args.output_stem.with_suffix('.pdf')}")
+
+    if args.metric in ("knn", "both"):
+        plot(
+            metrics["knn"],
+            args.knn_output_stem,
+            title="WirelessJEPA Masking Ablation — 500-shot kNN",
+            note=f"kNN {note[0].lower() + note[1:]}",
+        )
+        print(f"Wrote {args.knn_output_stem.with_suffix('.png')}")
+        print(f"Wrote {args.knn_output_stem.with_suffix('.pdf')}")
 
 
 if __name__ == "__main__":
