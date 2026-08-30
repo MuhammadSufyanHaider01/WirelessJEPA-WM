@@ -51,9 +51,25 @@ def make_train_val_datasets(
 
         for c in classes:
             c_idx = np.where(labels == c)[0]
-            if len(c_idx) < per_class_n:
-                print(f"[warn] Class {c} has only {len(c_idx)} samples; taking all.")
-                chosen = c_idx
+            if len(c_idx) <= per_class_n:
+                # Keep a validation split when the requested shot count is
+                # larger than the available samples (e.g. AoA has 100
+                # examples/class while the matrix uses --sample 500).
+                if len(c_idx) <= 1:
+                    print(
+                        f"[warn] Class {c} has only {len(c_idx)} sample; "
+                        "using it for training (no per-class validation sample available)."
+                    )
+                    chosen = c_idx
+                else:
+                    val_count = max(1, int(np.ceil(0.2 * len(c_idx))))
+                    train_count = len(c_idx) - val_count
+                    print(
+                        f"[warn] Class {c} has only {len(c_idx)} samples; "
+                        f"using {train_count} for training and reserving "
+                        f"{val_count} for validation."
+                    )
+                    chosen = np.random.choice(c_idx, size=train_count, replace=False)
             else:
                 chosen = np.random.choice(c_idx, size=per_class_n, replace=False)
             train_idx.append(chosen)
