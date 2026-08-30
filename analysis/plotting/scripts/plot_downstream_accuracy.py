@@ -136,6 +136,71 @@ def plot(
     plt.close(fig)
 
 
+
+def plot_comparison(
+    metrics: dict[str, dict[tuple[str, str], float]],
+    output_stem: Path,
+    *,
+    note: str,
+) -> None:
+    """Write one two-panel figure comparing linear probing and kNN."""
+    output_stem.parent.mkdir(parents=True, exist_ok=True)
+    x = np.arange(len(TASK_ORDER))
+    width = 0.19
+    fig, axes = plt.subplots(1, 2, figsize=(15.0, 6.8), sharey=True, dpi=180)
+
+    for panel_index, (ax, metric, panel_title) in enumerate(
+        zip(
+            axes,
+            ("linear", "knn"),
+            ("(a) Linear probing", "(b) kNN"),
+        )
+    ):
+        for index, mask in enumerate(MASK_ORDER):
+            accuracies = [metrics[metric][(mask, task)] for task in TASK_ORDER]
+            ax.bar(
+                x + (index - 1.5) * width,
+                accuracies,
+                width,
+                label=MASK_LABELS[mask] if panel_index == 0 else "_nolegend_",
+                color=COLORS[index],
+                edgecolor="#303030",
+                linewidth=0.8,
+                hatch=HATCHES[index],
+                alpha=0.92,
+            )
+        ax.set_title(panel_title, weight="bold", pad=12)
+        ax.set_xlabel("Downstream task")
+        ax.set_xticks(x, [TASK_LABELS[task] for task in TASK_ORDER])
+        ax.set_ylim(0, 105)
+        ax.set_yticks(np.arange(0, 101, 10))
+        ax.grid(axis="y", linestyle="--", alpha=0.35)
+        ax.set_axisbelow(True)
+
+    axes[0].set_ylabel("Top-1 accuracy (%)")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        ncol=4,
+        frameon=True,
+        facecolor="white",
+        edgecolor="#D0D0D0",
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.965),
+    )
+    fig.suptitle(
+        "WirelessJEPA Downstream Evaluation — Linear Probe vs kNN",
+        weight="bold",
+        y=1.02,
+    )
+    fig.text(0.5, 0.015, note, ha="center", fontsize=8.5, color="#555555")
+    fig.tight_layout(rect=(0, 0.055, 1, 0.90))
+    fig.savefig(output_stem.with_suffix(".png"), bbox_inches="tight")
+    fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -163,6 +228,12 @@ def main() -> None:
         default="both",
         help="Which metric to plot (default: both).",
     )
+    parser.add_argument(
+        "--comparison-output-stem",
+        type=Path,
+        default=repo_root / "analysis/plotting/figures/accuracy_500shots_linear_knn",
+        help="Combined two-panel output path without an extension; written when --metric=both.",
+    )
     args = parser.parse_args()
     metrics = load_top1_metrics(args.results_root)
     note = (
@@ -189,6 +260,11 @@ def main() -> None:
         )
         print(f"Wrote {args.knn_output_stem.with_suffix('.png')}")
         print(f"Wrote {args.knn_output_stem.with_suffix('.pdf')}")
+
+    if args.metric == "both":
+        plot_comparison(metrics, args.comparison_output_stem, note=note)
+        print(f"Wrote {args.comparison_output_stem.with_suffix('.png')}")
+        print(f"Wrote {args.comparison_output_stem.with_suffix('.pdf')}")
 
 
 if __name__ == "__main__":
