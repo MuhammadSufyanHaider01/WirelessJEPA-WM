@@ -104,11 +104,11 @@ def load_learned_policy(representation_kind, representation_checkpoint, dynamics
     actor.load_state_dict(actor_payload["model"]); actor.eval()
     return LearnedPolicy(representation, dynamics, side_encoder, actor, device, memory, side_only)
 
-def _simple_policy(name):
+def _simple_policy(name, oracle_step_db=1):
     if name == "random": return lambda obs, env: env.rng.random(2).astype(np.float32)
     if name == "fixed": return lambda obs, env: np.array([1.0, 0.0], dtype=np.float32)
     if name == "balanced": return lambda obs, env: np.array([.5, .5], dtype=np.float32)
-    if name == "oracle": return lambda obs, env: genie_action(env)
+    if name == "oracle": return lambda obs, env: genie_action(env, step_db=oracle_step_db)
     raise ValueError(name)
 
 
@@ -135,12 +135,12 @@ def main():
     p.add_argument("--actor-checkpoint")
     p.add_argument("--no-memory", action="store_true")
     p.add_argument("--side-only", action="store_true")
-    p.add_argument("--episodes", type=int, default=10); p.add_argument("--episode-length", type=int, default=100); p.add_argument("--seed", type=int, default=42); p.add_argument("--device", default="cpu"); p.add_argument("--output", required=True)
+    p.add_argument("--episodes", type=int, default=10); p.add_argument("--episode-length", type=int, default=100); p.add_argument("--seed", type=int, default=42); p.add_argument("--device", default="cpu"); p.add_argument("--oracle-step-db", type=int, default=1, help="grid spacing for smoke/final genie oracle") ; p.add_argument("--output", required=True)
     args = p.parse_args()
     output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
     all_rows, summaries = [], {}
     for name in args.policies:
-        rows, summary = evaluate_policy(_simple_policy(name), args.episodes, args.episode_length, args.seed)
+        rows, summary = evaluate_policy(_simple_policy(name, args.oracle_step_db), args.episodes, args.episode_length, args.seed)
         summaries[name] = summary
         all_rows.extend({"policy": name, **row} for row in rows)
     if args.learned_representation:
