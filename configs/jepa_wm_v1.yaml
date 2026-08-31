@@ -1,0 +1,36 @@
+# V1 partial-observation, non-RIS JEPA world-model defaults
+seed: 42
+representation:
+  latent_dim: 128
+  strategy: multi-block
+  mask_ratio: 0.5
+  epochs: 100
+  batch_size: 64
+  lr: 0.001
+  ema_start: 0.996
+vae:
+  latent_dim: 128
+  beta: 0.001
+  epochs: 100
+world_model:
+  latent_dim: 160
+  hidden_dim: 256
+  mixtures: 5
+  epochs: 50
+  sequence_length: 100
+controller:
+  action_dim: 2
+  input_dim: 416
+  actor_hidden: 128
+  episodes: 500
+  episode_length: 100
+  ppo_epochs: 4
+environment:
+  pilot_samples: 256
+  num_antennas: 4
+  tap_delays: [0, 2, 5]
+  tap_power_db: [0.0, -4.0, -8.0]
+  fading_correlation: 0.95
+  trajectory: static
+  max_steps: 100
+artifacts_root: artifacts/jepa_wm_v1

@@ -1,1 +1,1 @@
-"""Staged JEPA, dynamics, and controller training workflows."""
+"""Staged JEPA/VAE, latent-dynamics, and real-environment PPO training."""

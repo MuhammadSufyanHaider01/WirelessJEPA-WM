@@ -7,6 +7,7 @@ The destination project’s architecture and research contract are documented in
 
 - [Research overview](docs/JEPA_World_Model_Research_Overview.md)
 - [Architecture and implementation specification](docs/JEPA_World_Model_Architecture_Implementation.md)
+- [V1 implementation and commands](docs/JEPA_WM_V1_IMPLEMENTATION.md)
 
 ## CNN-JEPA: Self-Supervised Pretraining Convolutional Neural Networks Using Joint Embedding Predictive Architecture
 

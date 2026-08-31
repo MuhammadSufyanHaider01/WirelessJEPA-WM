@@ -1,1 +1,1 @@
-"""Representation, rollout, control, and ablation evaluation tools."""
+"""V1 control evaluation, genie baselines, and plotting helpers."""
