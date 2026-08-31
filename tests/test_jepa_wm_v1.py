@@ -9,6 +9,7 @@ from data.hap_uav import PilotWindowDataset, TrajectoryDataset, generate_expert_
 from environment.hap_uav import HapUavConfig, HapUavEnv, dbm_to_watts, watts_to_dbm
 from evaluation.hap_uav_eval import genie_action
 from models.jepa_wm import ActionConditionedMDNLSTM, JEPAWorldModelEncoder, LatentStateEncoder, PowerController, RFVAE
+from training.jepa_wm import _split_pilot_dataset
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -53,6 +54,12 @@ class DatasetTests(unittest.TestCase):
             traj = TrajectoryDataset(root / "traj.h5"); item = traj[0]
             self.assertEqual(item["iq"].shape, (3, 2, 4, 256)); self.assertEqual(item["side"].shape, (3, 8)); self.assertEqual(item["secrecy_rate"].shape, (3,))
             expert = TrajectoryDataset(root / "expert.h5"); self.assertEqual(expert[0]["action"].shape, (3, 2))
+            train_a, val_a = _split_pilot_dataset(pilot, 0.33, 123)
+            train_b, val_b = _split_pilot_dataset(pilot, 0.33, 123)
+            self.assertEqual(len(train_a) + len(val_a), len(pilot))
+            self.assertEqual(train_a.indices, train_b.indices)
+            self.assertEqual(val_a.indices, val_b.indices)
+            self.assertTrue(set(train_a.indices).isdisjoint(val_a.indices))
 
 
 class ModelTests(unittest.TestCase):

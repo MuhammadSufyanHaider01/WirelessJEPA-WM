@@ -23,7 +23,8 @@ python -m unittest tests.test_jepa_wm_v1 -v
 ## Staged experiment
 
 1. Generate independent-seed synthetic pilot windows and ordered trajectories with `data/generate_hap_uav.py`.
-2. Train JEPA (`multi-block` by default) and the matched VAE on the same raw windows.
+2. Train JEPA (`multi-block` by default) and the matched VAE on the same raw windows. The full-data RTX 6000 launcher uses a deterministic 90/10 pilot split, saves the best validation checkpoint, and enables patience-based early stopping:
+   `sbatch jepa-wm-rtx6000.slurm`
 3. Train the frozen-representation MDN-LSTM with `training/jepa_wm.py mdn`.
 4. Train the frozen JEPA/VAE controller with real-environment PPO (`--memory` for the MDN state; omit it for the no-memory ablation).
 5. Evaluate random, fixed, balanced, and full-state one-step genie policies with `evaluation/hap_uav_eval.py`; add learned-policy evaluation after the PPO checkpoints are available.

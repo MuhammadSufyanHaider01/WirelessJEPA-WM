@@ -17,7 +17,7 @@ from typing import Dict, Iterable, Optional
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from data.hap_uav import PilotWindowDataset, TrajectoryDataset
 from environment.hap_uav import HapUavConfig, HapUavEnv
@@ -73,17 +73,49 @@ def append_csv(path: Path, rows: Iterable[dict]) -> None:
         writer.writerows(rows)
 
 
+def _split_pilot_dataset(dataset: PilotWindowDataset, val_fraction: float, seed: int):
+    """Create deterministic, disjoint train/validation window subsets."""
+    if not 0.0 <= val_fraction < 1.0:
+        raise ValueError("val_fraction must be in [0, 1)")
+    count = len(dataset)
+    if count < 2 or val_fraction == 0.0:
+        return dataset, None
+    val_count = max(1, int(round(count * val_fraction)))
+    val_count = min(val_count, count - 1)
+    indices = np.random.default_rng(seed).permutation(count)
+    return Subset(dataset, indices[val_count:].tolist()), Subset(dataset, indices[:val_count].tolist())
+
+
+@torch.no_grad()
+def _jepa_validation_loss(model, loader, device, strategy: str):
+    if loader is None:
+        return float("nan")
+    model.eval()
+    values = []
+    for batch in loader:
+        result = model(batch.to(device, non_blocking=True), strategy=strategy)
+        values.append(float(result["loss"].detach().cpu()))
+    return float(np.mean(values)) if values else float("nan")
+
+
 def train_jepa(args) -> Path:
     seed_everything(args.seed)
     device = device_from(args.device)
-    dataset = PilotWindowDataset(args.data)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, num_workers=args.workers)
+    dataset = PilotWindowDataset(args.data, normalize=args.normalize)
+    train_dataset, val_dataset = _split_pilot_dataset(dataset, args.val_fraction, args.seed)
+    loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, num_workers=args.workers)
+    val_loader = (DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=args.workers)
+                  if val_dataset is not None else None)
     model = JEPAWorldModelEncoder(args.latent_dim, args.strategy, args.mask_ratio).to(device)
     optimizer = torch.optim.AdamW(
         list(model.context.parameters()) + list(model.predictor.parameters()),
         lr=args.lr, weight_decay=args.weight_decay,
     )
     history = []
+    out = Path(args.output)
+    best_val = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
     writer = make_tensorboard_writer(Path(args.output).with_suffix(".tensorboard"))
     for epoch in range(args.epochs):
         model.train()
@@ -97,13 +129,38 @@ def train_jepa(args) -> Path:
             optimizer.step()
             model.update_teacher(min(1.0, args.ema_start + (1.0 - args.ema_start) * epoch / max(args.epochs - 1, 1)))
             losses.append(float(result["loss"].detach().cpu()))
-        row = {"epoch": epoch + 1, "loss": float(np.mean(losses)), "strategy": args.strategy}
+        # Keep validation-mask draws comparable between epochs for reliable
+        # early stopping instead of comparing unrelated random masks.
+        torch.manual_seed(args.seed + 10_000 + epoch)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed + 10_000 + epoch)
+        val_loss = _jepa_validation_loss(model, val_loader, device, args.strategy)
+        row = {"epoch": epoch + 1, "loss": float(np.mean(losses)), "val_loss": val_loss, "strategy": args.strategy}
         history.append(row)
-        if writer: writer.add_scalar("jepa/loss", row["loss"], epoch + 1)
+        if writer:
+            writer.add_scalar("jepa/loss", row["loss"], epoch + 1)
+            if np.isfinite(val_loss):
+                writer.add_scalar("jepa/val_loss", val_loss, epoch + 1)
         print(json.dumps(row), flush=True)
+        improved = np.isfinite(val_loss) and val_loss < best_val - args.min_delta
+        if improved or (val_dataset is None and epoch == 0):
+            best_val = val_loss
+            best_epoch = epoch + 1
+            stale_epochs = 0
+            save_state(out, model, {"history": history}, latent_dim=args.latent_dim, strategy=args.strategy,
+                       best_epoch=best_epoch, best_val_loss=best_val, train_count=len(train_dataset),
+                       val_count=len(val_dataset) if val_dataset is not None else 0)
+        else:
+            stale_epochs += 1
+        if args.patience > 0 and val_dataset is not None and stale_epochs >= args.patience:
+            print(json.dumps({"early_stopping": True, "best_epoch": best_epoch,
+                              "best_val_loss": best_val, "patience": args.patience}), flush=True)
+            break
     if writer: writer.close()
-    out = Path(args.output)
-    save_state(out, model, {"history": history}, latent_dim=args.latent_dim, strategy=args.strategy)
+    if not out.exists():
+        save_state(out, model, {"history": history}, latent_dim=args.latent_dim, strategy=args.strategy,
+                   best_epoch=best_epoch, best_val_loss=best_val, train_count=len(train_dataset),
+                   val_count=len(val_dataset) if val_dataset is not None else 0)
     append_csv(out.with_suffix(".csv"), history)
     return out
 
@@ -278,7 +335,7 @@ def build_parser():
     sub = parser.add_subparsers(dest="stage", required=True)
     def common(p):
         p.add_argument("--data", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--epochs", type=int, default=1); p.add_argument("--batch-size", type=int, default=8); p.add_argument("--workers", type=int, default=0); p.add_argument("--lr", type=float, default=1e-3); p.add_argument("--weight-decay", type=float, default=1e-4)
-    p = sub.add_parser("jepa"); common(p); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--strategy", default="multi-block", choices=("random", "antenna", "time", "multi-block")); p.add_argument("--mask-ratio", type=float, default=.5); p.add_argument("--ema-start", type=float, default=.996); p.set_defaults(func=train_jepa)
+    p = sub.add_parser("jepa"); common(p); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--strategy", default="multi-block", choices=("random", "antenna", "time", "multi-block")); p.add_argument("--mask-ratio", type=float, default=.5); p.add_argument("--ema-start", type=float, default=.996); p.add_argument("--val-fraction", type=float, default=.1); p.add_argument("--patience", type=int, default=10, help="epochs without validation improvement before stopping; 0 disables"); p.add_argument("--min-delta", type=float, default=0.0); p.add_argument("--normalize", action="store_true", help="per-window max-magnitude normalization"); p.set_defaults(func=train_jepa)
     p = sub.add_parser("vae"); common(p); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--beta", type=float, default=1e-3); p.set_defaults(func=train_vae)
     p = sub.add_parser("mdn"); common(p); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--hidden-dim", type=int, default=256); p.add_argument("--mixtures", type=int, default=5); p.add_argument("--kpi-weight", type=float, default=.1); p.set_defaults(func=train_mdn)
     p = sub.add_parser("ppo"); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--dynamics-checkpoint", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--episodes", type=int, default=20); p.add_argument("--episode-length", type=int, default=100); p.add_argument("--actor-hidden", type=int, default=128); p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--gamma", type=float, default=.99); p.add_argument("--gae-lambda", type=float, default=.95); p.add_argument("--clip", type=float, default=.2); p.add_argument("--ppo-epochs", type=int, default=4); p.add_argument("--memory", action="store_true"); p.add_argument("--side-only", action="store_true"); p.set_defaults(func=train_ppo)
