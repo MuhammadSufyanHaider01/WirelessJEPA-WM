@@ -202,10 +202,48 @@ def generate_trajectory_hdf5(path: str | Path, episodes: int = 256, length: int 
     return {"path": str(path), "episodes": episodes, "length": length}
 
 
+def generate_expert_hdf5(path: str | Path, episodes: int = 256, length: int = 100, config: Optional[HapUavConfig] = None, seed: int = 42, grid_step_db: int = 1) -> dict:
+    """Generate one-step full-state genie trajectories for benchmarking.
+
+    The oracle sees simulator-only instantaneous channels. Its actions are an
+    upper-bound benchmark and must not be used as labels for the partial
+    observation policy in the primary experiment.
+    """
+    from evaluation.hap_uav_eval import genie_action
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = config or HapUavConfig(max_steps=length)
+    iq = np.zeros((episodes, length, 2, 4, cfg.pilot_samples), dtype=np.float32)
+    side = np.zeros((episodes, length, 8), dtype=np.float32)
+    action = np.zeros((episodes, length, 2), dtype=np.float32)
+    reward = np.zeros((episodes, length), dtype=np.float32)
+    done = np.zeros((episodes, length), dtype=np.bool_)
+    secrecy_rate = np.zeros((episodes, length), dtype=np.float32)
+    success = np.zeros((episodes, length), dtype=np.float32)
+    leakage = np.zeros((episodes, length), dtype=np.float32)
+    scenario_ids = np.arange(episodes, dtype=np.int64)
+    for episode in range(episodes):
+        episode_seed = int(seed + episode)
+        env = HapUavEnv(cfg); obs, _ = env.reset(seed=episode_seed, scenario=_scenario_for(episode_seed, cfg))
+        for t in range(length):
+            iq[episode, t] = obs["iq"]; side[episode, t] = obs["side"]
+            a = genie_action(env, step_db=grid_step_db); action[episode, t] = a
+            obs, r, term, trunc, info = env.step(a)
+            reward[episode, t] = r; secrecy_rate[episode, t] = float(info["secrecy_rate"])
+            success[episode, t] = float(info["mu_h"]); leakage[episode, t] = float(info["mu_u"])
+            done[episode, t] = term or trunc
+    with h5py.File(path, "w") as f:
+        for key, value in (("iq", iq), ("side", side), ("action", action), ("reward", reward), ("done", done), ("secrecy_rate", secrecy_rate), ("success", success), ("leakage", leakage), ("scenario_id", scenario_ids)):
+            f.create_dataset(key, data=value, compression="lzf" if value.ndim > 1 else None)
+        f.attrs["split_policy"] = "episodes are independent scenario seeds"
+        f.attrs["oracle"] = "full-state one-step grid upper bound; not a policy label"
+        f.attrs["grid_step_db"] = int(grid_step_db)
+    return {"path": str(path), "episodes": episodes, "length": length, "grid_step_db": grid_step_db}
+
+
 def write_manifest(path: str | Path, **entries) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n")
 
 
-__all__ = ["PilotWindowDataset", "TrajectoryDataset", "generate_pilot_hdf5", "generate_trajectory_hdf5", "write_manifest"]
+__all__ = ["PilotWindowDataset", "TrajectoryDataset", "generate_pilot_hdf5", "generate_trajectory_hdf5", "generate_expert_hdf5", "write_manifest"]

@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from data.hap_uav import PilotWindowDataset, TrajectoryDataset, generate_pilot_hdf5, generate_trajectory_hdf5
+from data.hap_uav import PilotWindowDataset, TrajectoryDataset, generate_expert_hdf5, generate_pilot_hdf5, generate_trajectory_hdf5
 from environment.hap_uav import HapUavConfig, HapUavEnv, dbm_to_watts, watts_to_dbm
 from evaluation.hap_uav_eval import genie_action
 from models.jepa_wm import ActionConditionedMDNLSTM, JEPAWorldModelEncoder, LatentStateEncoder, PowerController, RFVAE
@@ -48,9 +48,11 @@ class DatasetTests(unittest.TestCase):
             root = Path(tmp)
             generate_pilot_hdf5(root / "pilot.h5", 3, HapUavConfig(max_steps=1), 1)
             generate_trajectory_hdf5(root / "traj.h5", 2, 3, HapUavConfig(max_steps=3), 11)
+            generate_expert_hdf5(root / "expert.h5", 1, 3, HapUavConfig(max_steps=3), 21, grid_step_db=10)
             pilot = PilotWindowDataset(root / "pilot.h5"); self.assertEqual(pilot[0].shape, (2, 4, 256))
             traj = TrajectoryDataset(root / "traj.h5"); item = traj[0]
             self.assertEqual(item["iq"].shape, (3, 2, 4, 256)); self.assertEqual(item["side"].shape, (3, 8)); self.assertEqual(item["secrecy_rate"].shape, (3,))
+            expert = TrajectoryDataset(root / "expert.h5"); self.assertEqual(expert[0]["action"].shape, (3, 2))
 
 
 class ModelTests(unittest.TestCase):

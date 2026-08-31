@@ -380,6 +380,26 @@ class HapUavEnv:
             "required_rate": float(required),
         }
 
+    def preview_action(self, action_norm: Any, channels: Optional[Dict[str, np.ndarray]] = None) -> Tuple[float, Dict[str, Any]]:
+        """Score an action without advancing state (used by the genie oracle)."""
+        action = np.asarray(action_norm, dtype=np.float64).reshape(-1)
+        if action.size != 2:
+            raise ValueError(f"action must have shape (2,), got {action.shape}")
+        clipped = np.clip(action, 0.0, 1.0)
+        metrics = self._rates(clipped, channels or self._instantaneous_channels())
+        next_age_h = 1 if metrics["mu_h"] else min(self.age_h + 1, self.config.age_cap)
+        next_age_u = 1 if metrics["mu_u"] else min(self.age_u + 1, self.config.age_cap)
+        w_h, w_u, w_s, w_p, w_v = self.config.reward_weights
+        secrecy_norm = min(metrics["secrecy_rate"] / max(self.config.secrecy_rate_min_bps, EPS), 1.0)
+        reward = (
+            -w_h * next_age_h / float(self.config.age_cap)
+            + w_u * next_age_u / float(self.config.age_cap)
+            + w_s * secrecy_norm
+            - w_p * float(np.sum(clipped))
+            - w_v * float(not metrics["secrecy_gate"])
+        )
+        return float(reward), {**metrics, "age_h": next_age_h, "age_u": next_age_u, "action_norm": clipped.astype(np.float32)}
+
     def step(self, action_norm: Any) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         """Execute one data-phase action after the already observed pilot."""
 
@@ -390,20 +410,10 @@ class HapUavEnv:
             raise ValueError(f"action must have shape (2,), got {action.shape}")
         clipped = np.clip(action, 0.0, 1.0)
         channels = self._instantaneous_channels()
-        metrics = self._rates(clipped, channels)
-        self.age_h = 1 if metrics["mu_h"] else min(self.age_h + 1, self.config.age_cap)
-        self.age_u = 1 if metrics["mu_u"] else min(self.age_u + 1, self.config.age_cap)
-        w_h, w_u, w_s, w_p, w_v = self.config.reward_weights
-        age_h_norm = self.age_h / float(self.config.age_cap)
-        age_u_norm = self.age_u / float(self.config.age_cap)
-        secrecy_norm = min(metrics["secrecy_rate"] / max(self.config.secrecy_rate_min_bps, EPS), 1.0)
-        reward = (
-            -w_h * age_h_norm
-            + w_u * age_u_norm
-            + w_s * secrecy_norm
-            - w_p * float(np.sum(clipped))
-            - w_v * float(not metrics["secrecy_gate"])
-        )
+        reward, scored = self.preview_action(clipped, channels)
+        metrics = {key: value for key, value in scored.items() if key not in {"age_h", "age_u", "action_norm"}}
+        self.age_h = int(scored["age_h"])
+        self.age_u = int(scored["age_u"])
         self.previous_action = clipped.astype(np.float32)
         self.step_index += 1
         self._update_mobility()

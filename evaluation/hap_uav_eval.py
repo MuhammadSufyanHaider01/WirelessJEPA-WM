@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import json
 from pathlib import Path
@@ -17,17 +16,33 @@ from training.jepa_wm import _load_representation
 
 def genie_action(env: HapUavEnv, step_db: int = 1) -> np.ndarray:
     """One-step full-state grid oracle; never passed into policy observations."""
-    best, best_reward = np.zeros(2, dtype=np.float32), -float("inf")
-    values = np.arange(env.config.min_power_dbm, env.config.max_power_dbm + 0.1, step_db)
+    values = np.arange(env.config.min_power_dbm, env.config.max_power_dbm + 0.1, step_db, dtype=np.float64)
+    pt_dbm, pj_dbm = np.meshgrid(values, values, indexing="ij")
+    pt = np.power(10.0, (pt_dbm - 30.0) / 10.0)
+    pj = np.power(10.0, (pj_dbm - 30.0) / 10.0)
+    channels = env._instantaneous_channels()
+    h_sh = np.sum(channels["sh"], axis=0); h_su = np.sum(channels["su"])
+    h_hu = np.sum(channels["hu"]); h_jh = np.sum(channels["jh"]); h_ju = np.sum(channels["ju"])
+    noise = env._noise_watts()
+    gamma_h = pt * float(np.vdot(h_sh, h_sh).real) / (noise + env.config.residual_si_factor * pj * abs(h_jh) ** 2 + 1e-12)
+    gamma_u = pt * abs(h_su) ** 2 / (noise + pj * abs(h_ju) ** 2 + 1e-12)
+    rate_h = env.config.bandwidth_hz * np.log2(1.0 + gamma_h)
+    rate_u = env.config.bandwidth_hz * np.log2(1.0 + gamma_u)
+    secrecy = np.maximum(rate_h - rate_u, 0.0)
+    gate = secrecy >= env.config.secrecy_rate_min_bps
+    required = env.config.packet_bits / max(env.config.slot_duration_s, 1e-12)
+    decode = env.config.uav_decode_rate_bps or required
+    success = gate & (rate_h >= required); leakage = gate & (rate_u >= decode)
+    next_age_h = np.where(success, 1, np.minimum(env.age_h + 1, env.config.age_cap))
+    next_age_u = np.where(leakage, 1, np.minimum(env.age_u + 1, env.config.age_cap))
+    w_h, w_u, w_s, w_p, w_v = env.config.reward_weights
+    reward = (-w_h * next_age_h / env.config.age_cap + w_u * next_age_u / env.config.age_cap
+              + w_s * np.minimum(secrecy / max(env.config.secrecy_rate_min_bps, 1e-12), 1.0)
+              - w_p * ((pt_dbm - env.config.min_power_dbm) + (pj_dbm - env.config.min_power_dbm)) / (env.config.max_power_dbm - env.config.min_power_dbm)
+              - w_v * (~gate))
+    index = np.unravel_index(np.argmax(reward), reward.shape)
     span = env.config.max_power_dbm - env.config.min_power_dbm
-    for pt in values:
-        for pj in values:
-            candidate = np.array([(pt - env.config.min_power_dbm) / span, (pj - env.config.min_power_dbm) / span], dtype=np.float32)
-            clone = copy.deepcopy(env)
-            _, reward, _, _, _ = clone.step(candidate)
-            if reward > best_reward:
-                best_reward, best = reward, candidate
-    return best
+    return np.array([(pt_dbm[index] - env.config.min_power_dbm) / span, (pj_dbm[index] - env.config.min_power_dbm) / span], dtype=np.float32)
 
 
 def _stats(values):
