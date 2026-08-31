@@ -24,3 +24,16 @@ color and hatch pattern so it remains readable in grayscale or print. The
 current repository contains five tasks (`aoa`, `mod`, `rf`, `rml`, and `radar`);
 it is a comparable local result, not a complete reproduction of the paper's
 five OOD Figure 3 tasks.
+
+## Pretraining loss by masking strategy
+
+Run:
+
+```bash
+python analysis/plotting/scripts/plot_pretraining_loss.py
+```
+
+This writes `figures/pretraining_loss_by_mask.png` and `.pdf`, with one
+line/legend entry per masking strategy. It plots the epoch-level
+`train_metrics/ijepa_loss_epoch` values and merges the TensorBoard event files
+from resumed jobs so every mask covers epochs 0–99.
