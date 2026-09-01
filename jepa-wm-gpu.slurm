@@ -3,7 +3,7 @@
 # The trainer evaluates a deterministic 10% held-out pilot split each epoch,
 # keeps the best checkpoint, and stops after PATIENCE stale epochs.
 #SBATCH --job-name=jepa-wm
-#SBATCH --partition=gpu-l40
+#SBATCH --partition=gpu-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
