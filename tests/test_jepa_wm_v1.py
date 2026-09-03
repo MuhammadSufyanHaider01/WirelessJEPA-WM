@@ -9,7 +9,7 @@ from data.hap_uav import PilotWindowDataset, TrajectoryDataset, generate_expert_
 from environment.hap_uav import HapUavConfig, HapUavEnv, dbm_to_watts, watts_to_dbm
 from evaluation.hap_uav_eval import genie_action
 from models.jepa_wm import ActionConditionedMDNLSTM, JEPAWorldModelEncoder, LatentStateEncoder, PowerController, RFVAE
-from training.jepa_wm import _split_pilot_dataset
+from training.jepa_wm import _gae_returns, _split_pilot_dataset
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -63,6 +63,24 @@ class DatasetTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_gae_bootstraps_rollout_boundaries(self):
+        rewards = torch.tensor([1.0])
+        values = torch.tensor([0.0])
+        bootstrap = torch.tensor(2.0)
+        returns, advantages = _gae_returns(rewards, values, [False], bootstrap, .99, .95, 1.0)
+        self.assertAlmostEqual(float(returns[0]), 1.0 + .99 * 2.0, places=6)
+        terminal_returns, _ = _gae_returns(rewards, values, [True], bootstrap, .99, .95, 1.0)
+        self.assertAlmostEqual(float(terminal_returns[0]), 1.0, places=6)
+
+    def test_controller_entropy_and_bounded_log_std(self):
+        controller = PowerController(initial_log_std=2.0, max_log_std=.5)
+        features = torch.zeros(3, 416)
+        action, logp = controller.action(features)
+        self.assertTrue(torch.isfinite(logp).all())
+        self.assertTrue(torch.isfinite(controller.entropy(features)).all())
+        self.assertLessEqual(float(controller.distribution(features).scale.max()), float(torch.exp(torch.tensor(.5))) + 1e-6)
+        self.assertTrue(torch.all((action >= 0) & (action <= 1)))
+
     def test_model_interfaces_and_gradients(self):
         x = torch.randn(1, 2, 4, 256)
         jepa = JEPAWorldModelEncoder(); result = jepa(x)

@@ -222,17 +222,33 @@ class ActionConditionedMDNLSTM(nn.Module):
 
 
 class PowerController(nn.Module):
-    """Compact bounded two-power actor used by PPO and controller probes."""
-    def __init__(self, input_dim: int = 416, hidden_dim: int = 128):
+    """Compact bounded two-power actor used by PPO and controller probes.
+
+    The policy is a sigmoid-squashed diagonal Gaussian.  The trainable
+    log-standard-deviation is clamped when constructing the distribution so
+    that long real-environment runs cannot silently lose all exploration (or
+    become numerically unstable near the action boundaries).
+    """
+    def __init__(
+        self,
+        input_dim: int = 416,
+        hidden_dim: int = 128,
+        initial_log_std: float = -0.7,
+        min_log_std: float = -2.5,
+        max_log_std: float = 1.0,
+    ):
         super().__init__()
         self.net = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 2))
-        self.log_std = nn.Parameter(torch.full((2,), -0.7))
+        self.log_std = nn.Parameter(torch.full((2,), float(initial_log_std)))
+        self.min_log_std = float(min_log_std)
+        self.max_log_std = float(max_log_std)
 
     def forward(self, features: torch.Tensor):
         return self.net(features)
 
     def distribution(self, features: torch.Tensor):
-        return torch.distributions.Normal(self.net(features), self.log_std.exp())
+        log_std = self.log_std.clamp(self.min_log_std, self.max_log_std)
+        return torch.distributions.Normal(self.net(features), log_std.exp())
 
     def action(self, features: torch.Tensor, deterministic: bool = False):
         distribution = self.distribution(features)
@@ -246,6 +262,15 @@ class PowerController(nn.Module):
         raw = torch.logit(bounded)
         distribution = self.distribution(features)
         return distribution.log_prob(raw).sum(-1) - torch.log(bounded * (1.0 - bounded) + 1e-6).sum(-1)
+
+    def entropy(self, features: torch.Tensor) -> torch.Tensor:
+        """Base-distribution entropy used as a stable exploration bonus.
+
+        The exact entropy of a sigmoid-transformed Gaussian has no convenient
+        closed form.  The Normal entropy is a useful, monotonic proxy and is
+        independent of sampled actions, which makes it suitable for PPO.
+        """
+        return self.distribution(features).entropy().sum(-1)
 
 
 def parameter_count(module: nn.Module) -> int:

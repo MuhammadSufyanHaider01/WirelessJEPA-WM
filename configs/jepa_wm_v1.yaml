@@ -23,8 +23,13 @@ controller:
   input_dim: 416
   actor_hidden: 128
   episodes: 500
-  episode_length: 100
+  episode_length: 5000
+  rollout_steps: 512
+  minibatch_size: 256
   ppo_epochs: 4
+  entropy_coef: 0.01
+  target_kl: 0.03
+  initial_log_std: 0.7
 environment:
   pilot_samples: 256
   num_antennas: 4
@@ -32,5 +37,5 @@ environment:
   tap_power_db: [0.0, -4.0, -8.0]
   fading_correlation: 0.95
   trajectory: static
-  max_steps: 100
+  max_steps: 5000
 artifacts_root: artifacts/jepa_wm_v1

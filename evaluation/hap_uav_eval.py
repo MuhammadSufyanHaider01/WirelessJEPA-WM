@@ -97,7 +97,8 @@ class LearnedPolicy:
             if self.side_only:
                 rf = torch.zeros_like(rf)
             z = torch.cat([rf, self.side_encoder.side_encoder(side)], dim=-1)
-            h = self.hidden[0].transpose(0, 1).reshape(1, -1) if self.hidden is not None else torch.zeros(1, 256, device=self.device)
+            hidden_dim = int(getattr(self.dynamics, "hidden_dim", 256))
+            h = self.hidden[0].transpose(0, 1).reshape(1, -1) if self.hidden is not None else torch.zeros(1, hidden_dim, device=self.device)
             features = torch.cat([z, h], dim=-1)
             action, _ = self.actor.action(features, deterministic=True)
             if self.memory:
@@ -115,7 +116,13 @@ def load_learned_policy(representation_kind, representation_checkpoint, dynamics
     dynamics.load_state_dict(dynamics_payload["model"]); dynamics.eval()
     side_encoder = LatentStateEncoder(128, 32).to(device); side_encoder.load_state_dict(dynamics_payload["side_encoder"]); side_encoder.eval()
     actor_payload = torch.load(actor_checkpoint, map_location=device)
-    actor = PowerController(416, actor_payload.get("actor_hidden", 128)).to(device)
+    actor_input_dim = int(actor_payload.get("feature_dim", 128 + 32 + dynamics.hidden_dim))
+    actor = PowerController(
+        actor_input_dim,
+        actor_payload.get("actor_hidden", 128),
+        min_log_std=actor_payload.get("min_log_std", -2.5),
+        max_log_std=actor_payload.get("max_log_std", 1.0),
+    ).to(device)
     actor.load_state_dict(actor_payload["model"]); actor.eval()
     return LearnedPolicy(representation, dynamics, side_encoder, actor, device, memory, side_only)
 

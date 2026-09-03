@@ -25,8 +25,12 @@ python -m unittest tests.test_jepa_wm_v1 -v
 2. Train JEPA (`multi-block` by default) on the raw windows. Alternative representation baselines are intentionally deferred. The full-data GPU launcher uses a deterministic 90/10 pilot split, saves the best validation checkpoint, and enables patience-based early stopping:
    `sbatch jepa-wm-gpu.slurm`
 3. Train the frozen-JEPA MDN-LSTM and side-information MLP with `training/jepa_wm.py mdn`; the full A100 launcher is `sbatch mdn-wm-gpu.slurm`.
-4. Train the frozen JEPA controller with real-environment PPO (`--memory` for the MDN state; omit it for the no-memory ablation). The full 500-episode A100 launcher is `sbatch ppo-wm-gpu.slurm`.
+4. Train the frozen JEPA controller with real-environment PPO (`--memory` for the MDN state; omit it for the no-memory ablation). The default controller horizon is 5,000 slots per episode; PPO updates every 512 transitions with recurrent state carried between rollout chunks. The full 500-episode launcher is `sbatch ppo-wm-gpu.slurm` and writes `ppo_jepa_5000.pt` plus `ppo_jepa_5000_best.pt`.
 5. Evaluate random, fixed, balanced, and full-state one-step genie policies with `evaluation/hap_uav_eval.py`; add learned-policy evaluation after the PPO checkpoints are available.
 6. Plot CSV reports with `analysis/plotting/scripts/plot_jepa_wm_results.py`.
 
 The simulator returns only `iq: [2,4,256]` and `side: [8]` to normal policies. Instantaneous UAV channels exist only in `HapUavEnv.privileged_state()` for the explicitly labelled oracle. Pilot generation precedes every action, and pilot/data use the same current channel realization. HDF5 datasets are raw and antenna upsampling is performed only in the model.
+
+### Corrected long-horizon PPO
+
+The controller keeps the exact environment reward and action mapping while using shuffled rollout minibatches, separate actor/critic optimizers and gradient clipping, GAE bootstrapping at rollout boundaries, entropy-controlled sigmoid-Gaussian exploration, approximate-KL stopping, and per-episode diagnostics (`entropy`, `approx_kl`, `clip_fraction`, action log-standard-deviations, and rollout count). The 5,000-step environment horizon is distinct from the 512-step update horizon. The MDN checkpoint remains trained on the available 100-step trajectories; long-horizon memory quality must be reported as a validation metric rather than assumed.

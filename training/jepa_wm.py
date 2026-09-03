@@ -251,84 +251,274 @@ def train_mdn(args) -> Path:
 
 class ValueNet(nn.Module):
     def __init__(self, input_dim=416):
-        super().__init__(); self.net = nn.Sequential(nn.Linear(input_dim, 128), nn.Tanh(), nn.Linear(128, 1))
-    def forward(self, x): return self.net(x).squeeze(-1)
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(input_dim, 128), nn.Tanh(), nn.Linear(128, 1))
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
 
 
 def _feature(obs, representation, side_encoder, dynamics, hidden, device, memory=True, side_only=False):
+    """Encode one causal observation once and return ``(features, z)``.
+
+    ``z`` is reused for the frozen MDN state update after the action.  The old
+    implementation encoded the same pilot twice per step, which became a
+    major cost at the 5,000-step horizon.
+    """
     iq = torch.from_numpy(obs["iq"]).to(device).unsqueeze(0)
     side = torch.from_numpy(obs["side"]).to(device).unsqueeze(0)
     with torch.no_grad():
         rf = representation.encode_rf(iq)
-        if side_only: rf = torch.zeros_like(rf)
+        if side_only:
+            rf = torch.zeros_like(rf)
         z = torch.cat([rf, side_encoder.side_encoder(side)], dim=-1)
-        h = hidden[0].transpose(0, 1).reshape(1, -1) if hidden is not None else torch.zeros(1, 256, device=device)
+        hidden_dim = int(getattr(dynamics, "hidden_dim", 256))
+        h = (
+            hidden[0].transpose(0, 1).reshape(1, -1)
+            if hidden is not None and memory
+            else torch.zeros(1, hidden_dim, device=device)
+        )
         features = torch.cat([z, h], dim=-1)
-    return features
+    return features, z
+
+
+def _gae_returns(rewards, values, terminal_flags, bootstrap, gamma, gae_lambda, reward_scale):
+    """Compute GAE targets, bootstrapping rollout truncations but not terminals."""
+    scaled_rewards = rewards * float(reward_scale)
+    returns = []
+    advantages = []
+    gae = torch.zeros((), device=rewards.device)
+    next_value = bootstrap
+    for index in reversed(range(rewards.shape[0])):
+        nonterminal = 1.0 - float(terminal_flags[index])
+        delta = scaled_rewards[index] + gamma * next_value * nonterminal - values[index]
+        gae = delta + gamma * gae_lambda * nonterminal * gae
+        advantages.insert(0, gae)
+        returns.insert(0, gae + values[index])
+        next_value = values[index]
+    return torch.stack(returns), torch.stack(advantages)
+
+
+def _ppo_update(actor, critic, actor_optimizer, critic_optimizer, features, actions,
+                old_logp, returns, advantages, args):
+    """Run shuffled minibatch PPO updates for one recurrent rollout chunk."""
+    count = int(features.shape[0])
+    normalized_advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    minibatch_size = max(1, min(int(args.minibatch_size), count))
+    records = []
+    for _ in range(args.ppo_epochs):
+        permutation = torch.randperm(count, device=features.device)
+        epoch_records = []
+        for begin in range(0, count, minibatch_size):
+            indices = permutation[begin:begin + minibatch_size]
+            batch_features = features[indices]
+            batch_actions = actions[indices]
+            batch_old_logp = old_logp[indices]
+            batch_returns = returns[indices]
+            batch_advantages = normalized_advantages[indices]
+
+            new_logp = actor.log_prob(batch_features, batch_actions)
+            ratio = torch.exp((new_logp - batch_old_logp).clamp(-20.0, 20.0))
+            clipped_ratio = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip)
+            surrogate = torch.minimum(ratio * batch_advantages, clipped_ratio * batch_advantages)
+            entropy = actor.entropy(batch_features).mean()
+            policy_loss = -surrogate.mean()
+            actor_loss = policy_loss - args.entropy_coef * entropy
+            actor_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
+            actor_optimizer.step()
+
+            value_prediction = critic(batch_features)
+            value_loss = torch.nn.functional.mse_loss(value_prediction, batch_returns)
+            critic_optimizer.zero_grad(set_to_none=True)
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
+            critic_optimizer.step()
+
+            with torch.no_grad():
+                # Measure KL after the actor step; using ``new_logp`` here
+                # would compare the policy with itself and always report ~0.
+                post_update_logp = actor.log_prob(batch_features, batch_actions)
+                log_ratio = (post_update_logp - batch_old_logp).clamp(-20.0, 20.0)
+                # A non-negative sample estimate of KL(old || new).
+                approx_kl = (torch.exp(log_ratio) - 1.0 - log_ratio).mean()
+                clip_fraction = (torch.abs(ratio - 1.0) > args.clip).float().mean()
+            epoch_records.append({
+                "policy_loss": float(policy_loss.detach().cpu()),
+                "value_loss": float(value_loss.detach().cpu()),
+                "entropy": float(entropy.detach().cpu()),
+                "approx_kl": float(approx_kl.cpu()),
+                "clip_fraction": float(clip_fraction.cpu()),
+            })
+        records.extend(epoch_records)
+        if args.target_kl > 0.0 and epoch_records:
+            epoch_kl = float(np.mean([record["approx_kl"] for record in epoch_records]))
+            if epoch_kl > args.target_kl:
+                break
+    if not records:
+        return {key: 0.0 for key in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction")}
+    return {key: float(np.mean([record[key] for record in records])) for key in records[0]}
 
 
 def train_ppo(args) -> Path:
     seed_everything(args.seed)
+    if args.episode_length < 1:
+        raise ValueError("episode_length must be positive")
+    if args.rollout_steps < 1:
+        raise ValueError("rollout_steps must be positive")
     device = device_from(args.device)
     representation = _load_representation(args.representation, args.representation_checkpoint, device)
     dynamics_payload = torch.load(args.dynamics_checkpoint, map_location=device)
-    dynamics = ActionConditionedMDNLSTM(160, dynamics_payload.get("hidden_dim", 256), dynamics_payload.get("mixtures", 5)).to(device)
-    dynamics.load_state_dict(dynamics_payload["model"]); dynamics.eval()
-    side_encoder = LatentStateEncoder(128, 32).to(device); side_encoder.load_state_dict(dynamics_payload["side_encoder"]); side_encoder.eval()
-    actor = PowerController(416, args.actor_hidden).to(device)
-    critic = ValueNet(416).to(device)
-    optimizer = torch.optim.AdamW(list(actor.parameters()) + list(critic.parameters()), lr=args.lr)
+    dynamics = ActionConditionedMDNLSTM(
+        160, dynamics_payload.get("hidden_dim", 256), dynamics_payload.get("mixtures", 5)
+    ).to(device)
+    dynamics.load_state_dict(dynamics_payload["model"])
+    dynamics.eval()
+    side_encoder = LatentStateEncoder(128, 32).to(device)
+    side_encoder.load_state_dict(dynamics_payload["side_encoder"])
+    side_encoder.eval()
+    feature_dim = 128 + 32 + int(dynamics.hidden_dim)
+    actor = PowerController(
+        feature_dim,
+        args.actor_hidden,
+        initial_log_std=args.initial_log_std,
+        min_log_std=args.min_log_std,
+        max_log_std=args.max_log_std,
+    ).to(device)
+    critic = ValueNet(feature_dim).to(device)
+    actor_optimizer = torch.optim.AdamW(actor.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=args.critic_lr, weight_decay=args.weight_decay)
     env_cfg = HapUavConfig(max_steps=args.episode_length)
     history = []
-    writer = make_tensorboard_writer(Path(args.output).with_suffix(".tensorboard"))
+    out = Path(args.output)
+    best_path = out.with_name(out.stem + "_best" + out.suffix)
+    best_return = float("-inf")
+    writer = make_tensorboard_writer(out.with_suffix(".tensorboard"))
+    metric_keys = ("age_h", "age_u", "secrecy_rate", "secrecy_gate", "mu_h", "mu_u", "pt_dbm", "pj_dbm")
+
     for episode in range(args.episodes):
-        env = HapUavEnv(env_cfg); obs, _ = env.reset(seed=args.seed + episode)
-        hidden = None; features = []; actions = []; old_logp = []; rewards = []; values = []; dones = []
-        episode_metrics = {key: [] for key in ("age_h", "age_u", "secrecy_rate", "secrecy_gate", "mu_h", "mu_u", "pt_dbm", "pj_dbm")}
-        for _ in range(args.episode_length):
-            f = _feature(obs, representation, side_encoder, dynamics, hidden, device, args.memory, args.side_only)
-            with torch.no_grad():
-                a, lp = actor.action(f); value = critic(f)
-            next_obs, reward, term, trunc, info = env.step(a.squeeze(0).cpu().numpy())
-            for key in episode_metrics:
-                if key in info:
-                    episode_metrics[key].append(float(info[key]))
-            with torch.no_grad():
-                rf = representation.encode_rf(torch.from_numpy(obs["iq"]).to(device).unsqueeze(0))
-                if args.side_only: rf = torch.zeros_like(rf)
-                z = torch.cat([rf, side_encoder.side_encoder(torch.from_numpy(obs["side"]).to(device).unsqueeze(0))], dim=-1)
+        env = HapUavEnv(env_cfg)
+        obs, _ = env.reset(seed=args.seed + episode)
+        hidden = None
+        episode_done = False
+        episode_return = 0.0
+        episode_steps = 0
+        episode_metrics = {key: [] for key in metric_keys}
+        update_records = []
+
+        # The environment horizon is 5,000 by default, while PPO updates every
+        # rollout_steps transitions.  Hidden state is carried across chunks.
+        while not episode_done and episode_steps < args.episode_length:
+            features = []
+            actions = []
+            old_logp = []
+            values = []
+            rewards = []
+            terminal_flags = []
+            chunk_size = min(args.rollout_steps, args.episode_length - episode_steps)
+            for _ in range(chunk_size):
+                current_features, z = _feature(
+                    obs, representation, side_encoder, dynamics, hidden, device,
+                    args.memory, args.side_only,
+                )
+                with torch.no_grad():
+                    action, logp = actor.action(current_features)
+                    value = critic(current_features)
+                next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).cpu().numpy())
+                for key in metric_keys:
+                    if key in info:
+                        episode_metrics[key].append(float(info[key]))
                 if args.memory:
-                    hidden = dynamics(z, a, hidden).hidden
+                    with torch.no_grad():
+                        hidden = dynamics(z, action, hidden).hidden
                 else:
                     hidden = None
-            features.append(f.squeeze(0)); actions.append(a.squeeze(0)); old_logp.append(lp.squeeze(0)); rewards.append(reward); values.append(value.squeeze(0)); dones.append(term or trunc)
-            obs = next_obs
-            if term or trunc: break
-        with torch.no_grad():
-            returns = []; gae = torch.zeros((), device=device); next_value = torch.zeros((), device=device)
-            for i in reversed(range(len(rewards))):
-                delta = torch.tensor(rewards[i], device=device) + args.gamma * next_value * (1.0 - float(dones[i])) - values[i]
-                gae = delta + args.gamma * args.gae_lambda * (1.0 - float(dones[i])) * gae
-                returns.insert(0, gae + values[i]); next_value = values[i]
-            returns = torch.stack(returns); old_values = torch.stack(values); old_logp_t = torch.stack(old_logp); features_t = torch.stack(features); actions_t = torch.stack(actions)
-        advantages = (returns - old_values); advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        for _ in range(args.ppo_epochs):
-            logp = actor.log_prob(features_t, actions_t); ratio = torch.exp(logp - old_logp_t); clipped = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip)
-            policy_loss = -(torch.minimum(ratio * advantages, clipped * advantages)).mean()
-            value_loss = torch.nn.functional.mse_loss(critic(features_t), returns)
-            loss = policy_loss + 0.5 * value_loss
-            optimizer.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), 1.0); optimizer.step()
-        row = {"episode": episode + 1, "return": float(sum(rewards)), "mean_reward": float(np.mean(rewards)), "policy_loss": float(policy_loss.detach().cpu()), "value_loss": float(value_loss.detach().cpu())}
+                features.append(current_features.squeeze(0).detach())
+                actions.append(action.squeeze(0).detach())
+                old_logp.append(logp.squeeze(0).detach())
+                values.append(value.squeeze(0).detach())
+                rewards.append(float(reward))
+                # A true termination has no value bootstrap.  A rollout or
+                # external truncation still bootstraps the next state.
+                terminal_flags.append(bool(terminated))
+                episode_return += float(reward)
+                episode_steps += 1
+                obs = next_obs
+                episode_done = bool(terminated or truncated)
+                if episode_done:
+                    break
+
+            features_t = torch.stack(features)
+            actions_t = torch.stack(actions)
+            old_logp_t = torch.stack(old_logp)
+            values_t = torch.stack(values)
+            rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                if terminal_flags[-1]:
+                    bootstrap = torch.zeros((), device=device)
+                else:
+                    next_features, _ = _feature(
+                        obs, representation, side_encoder, dynamics, hidden, device,
+                        args.memory, args.side_only,
+                    )
+                    bootstrap = critic(next_features).squeeze(0)
+                returns_t, advantages_t = _gae_returns(
+                    rewards_t, values_t, terminal_flags, bootstrap,
+                    args.gamma, args.gae_lambda, args.reward_scale,
+                )
+            update_records.append(_ppo_update(
+                actor, critic, actor_optimizer, critic_optimizer,
+                features_t, actions_t, old_logp_t, returns_t, advantages_t, args,
+            ))
+
+        row = {
+            "episode": episode + 1,
+            "steps": episode_steps,
+            "return": float(episode_return),
+            "mean_reward": float(episode_return / max(episode_steps, 1)),
+            "rollout_updates": len(update_records),
+            "policy_loss": float(np.mean([record["policy_loss"] for record in update_records])),
+            "value_loss": float(np.mean([record["value_loss"] for record in update_records])),
+            "entropy": float(np.mean([record["entropy"] for record in update_records])),
+            "approx_kl": float(np.mean([record["approx_kl"] for record in update_records])),
+            "clip_fraction": float(np.mean([record["clip_fraction"] for record in update_records])),
+            "log_std_pt": float(actor.log_std[0].clamp(args.min_log_std, args.max_log_std).detach().cpu()),
+            "log_std_pj": float(actor.log_std[1].clamp(args.min_log_std, args.max_log_std).detach().cpu()),
+        }
         for key, values_for_key in episode_metrics.items():
             if values_for_key:
                 row[key] = float(np.mean(values_for_key))
         history.append(row)
         if writer:
-            writer.add_scalar("ppo/return", row["return"], episode + 1); writer.add_scalar("ppo/policy_loss", row["policy_loss"], episode + 1); writer.add_scalar("ppo/value_loss", row["value_loss"], episode + 1)
+            for key, value in row.items():
+                if key not in {"episode"} and np.isfinite(value):
+                    writer.add_scalar("ppo/" + key, value, episode + 1)
+            writer.flush()
+        if episode_return > best_return:
+            best_return = episode_return
+            save_state(
+                best_path, actor, {"history": history, "best_return": best_return},
+                critic=critic.state_dict(), representation=args.representation,
+                memory=args.memory, side_only=args.side_only, actor_hidden=args.actor_hidden,
+                feature_dim=feature_dim, episode_length=args.episode_length,
+                rollout_steps=args.rollout_steps, min_log_std=args.min_log_std,
+                max_log_std=args.max_log_std,
+            )
         print(json.dumps(row), flush=True)
-    if writer: writer.close()
-    out = Path(args.output); save_state(out, actor, {"history": history}, critic=critic.state_dict(), representation=args.representation, memory=args.memory, side_only=args.side_only, actor_hidden=args.actor_hidden); append_csv(out.with_suffix(".csv"), history); return out
 
+    if writer:
+        writer.close()
+    save_state(
+        out, actor, {"history": history, "best_return": best_return},
+        critic=critic.state_dict(), representation=args.representation,
+        memory=args.memory, side_only=args.side_only, actor_hidden=args.actor_hidden,
+        feature_dim=feature_dim, episode_length=args.episode_length,
+        rollout_steps=args.rollout_steps, min_log_std=args.min_log_std,
+        max_log_std=args.max_log_std,
+    )
+    append_csv(out.with_suffix(".csv"), history)
+    return out
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -338,7 +528,7 @@ def build_parser():
     p = sub.add_parser("jepa"); common(p); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--strategy", default="multi-block", choices=("random", "antenna", "time", "multi-block")); p.add_argument("--mask-ratio", type=float, default=.5); p.add_argument("--ema-start", type=float, default=.996); p.add_argument("--val-fraction", type=float, default=.1); p.add_argument("--patience", type=int, default=10, help="epochs without validation improvement before stopping; 0 disables"); p.add_argument("--min-delta", type=float, default=0.0); p.add_argument("--normalize", action="store_true", help="per-window max-magnitude normalization"); p.set_defaults(func=train_jepa)
     p = sub.add_parser("vae"); common(p); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--beta", type=float, default=1e-3); p.set_defaults(func=train_vae)
     p = sub.add_parser("mdn"); common(p); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--hidden-dim", type=int, default=256); p.add_argument("--mixtures", type=int, default=5); p.add_argument("--kpi-weight", type=float, default=.1); p.set_defaults(func=train_mdn)
-    p = sub.add_parser("ppo"); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--dynamics-checkpoint", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--episodes", type=int, default=20); p.add_argument("--episode-length", type=int, default=100); p.add_argument("--actor-hidden", type=int, default=128); p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--gamma", type=float, default=.99); p.add_argument("--gae-lambda", type=float, default=.95); p.add_argument("--clip", type=float, default=.2); p.add_argument("--ppo-epochs", type=int, default=4); p.add_argument("--memory", action="store_true"); p.add_argument("--side-only", action="store_true"); p.set_defaults(func=train_ppo)
+    p = sub.add_parser("ppo"); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--dynamics-checkpoint", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--episodes", type=int, default=500); p.add_argument("--episode-length", type=int, default=5000); p.add_argument("--rollout-steps", type=int, default=512, help="transitions per recurrent PPO update; does not shorten the episode"); p.add_argument("--minibatch-size", type=int, default=256); p.add_argument("--actor-hidden", type=int, default=128); p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--critic-lr", type=float, default=1e-3); p.add_argument("--weight-decay", type=float, default=0.0); p.add_argument("--gamma", type=float, default=.99); p.add_argument("--gae-lambda", type=float, default=.95); p.add_argument("--clip", type=float, default=.2); p.add_argument("--ppo-epochs", type=int, default=4); p.add_argument("--entropy-coef", type=float, default=.01); p.add_argument("--target-kl", type=float, default=.03); p.add_argument("--max-grad-norm", type=float, default=.5); p.add_argument("--reward-scale", type=float, default=1.0); p.add_argument("--initial-log-std", type=float, default=.7); p.add_argument("--min-log-std", type=float, default=-2.5); p.add_argument("--max-log-std", type=float, default=1.0); p.add_argument("--memory", action="store_true"); p.add_argument("--side-only", action="store_true"); p.set_defaults(func=train_ppo)
     return parser
 
 
