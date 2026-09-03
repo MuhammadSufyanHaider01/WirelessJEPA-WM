@@ -25,7 +25,7 @@ python -m unittest tests.test_jepa_wm_v1 -v
 2. Train JEPA (`multi-block` by default) on the raw windows. Alternative representation baselines are intentionally deferred. The full-data GPU launcher uses a deterministic 90/10 pilot split, saves the best validation checkpoint, and enables patience-based early stopping:
    `sbatch jepa-wm-gpu.slurm`
 3. Train the frozen-JEPA MDN-LSTM and side-information MLP with `training/jepa_wm.py mdn`; the full A100 launcher is `sbatch mdn-wm-gpu.slurm`.
-4. Train the frozen JEPA controller with real-environment PPO (`--memory` for the MDN state; omit it for the no-memory ablation).
+4. Train the frozen JEPA controller with real-environment PPO (`--memory` for the MDN state; omit it for the no-memory ablation). The full 500-episode A100 launcher is `sbatch ppo-wm-gpu.slurm`.
 5. Evaluate random, fixed, balanced, and full-state one-step genie policies with `evaluation/hap_uav_eval.py`; add learned-policy evaluation after the PPO checkpoints are available.
 6. Plot CSV reports with `analysis/plotting/scripts/plot_jepa_wm_results.py`.
 
