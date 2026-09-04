@@ -37,9 +37,13 @@ case "${STRATEGY}" in
   *) echo "Unsupported JEPA strategy ${STRATEGY}" >&2; exit 2 ;;
 esac
 DEFAULT_STEM="${STRATEGY//-/_}"
-OUTPUT="${JEPA_WM_OUTPUT:-${PWD}/artifacts/jepa_wm_v1/checkpoints/jepa_${DEFAULT_STEM}_gpu.pt}"
+OUTPUT="${JEPA_WM_OUTPUT:-${PWD}/artifacts/jepa_wm_v1/checkpoints/jepa_${DEFAULT_STEM}_gpu_v2.pt}"
 EPOCHS="${JEPA_WM_EPOCHS:-100}"
-PATIENCE="${JEPA_WM_PATIENCE:-10}"
+PATIENCE="${JEPA_WM_PATIENCE:-20}"
+LR="${JEPA_WM_LR:-3e-4}"
+VAL_REPEATS="${JEPA_WM_VAL_REPEATS:-4}"
+WARMUP_EPOCHS="${JEPA_WM_WARMUP_EPOCHS:-5}"
+ANTENNA_RATIOS="${JEPA_WM_ANTENNA_RATIOS:-0.5}"
 BATCH_SIZE="${JEPA_WM_BATCH_SIZE:-64}"
 WORKERS="${JEPA_WM_WORKERS:-4}"
 mkdir -p "$(dirname "${OUTPUT}")"
@@ -57,7 +61,7 @@ if arch not in supported:
     raise SystemExit(f"PyTorch build does not support {arch}; choose a CUDA-compatible GPU (A100/H100/V100)")
 PY
 
-echo "Starting JEPA on ${HOSTNAME}; strategy=${STRATEGY}; data=${DATA}; output=${OUTPUT}; epochs=${EPOCHS}; patience=${PATIENCE}" >&2
+echo "Starting JEPA on ${HOSTNAME}; strategy=${STRATEGY}; data=${DATA}; output=${OUTPUT}; epochs=${EPOCHS}; patience=${PATIENCE}; lr=${LR}" >&2
 srun python3 -u training/jepa_wm.py jepa \
   --data "${DATA}" \
   --output "${OUTPUT}" \
@@ -67,7 +71,11 @@ srun python3 -u training/jepa_wm.py jepa \
   --workers "${WORKERS}" \
   --strategy "${STRATEGY}" \
   --mask-ratio 0.5 \
+  --antenna-ratios ${ANTENNA_RATIOS} \
+  --lr "${LR}" \
   --val-fraction 0.10 \
+  --val-repeats "${VAL_REPEATS}" \
+  --warmup-epochs "${WARMUP_EPOCHS}" \
   --patience "${PATIENCE}" \
   --min-delta 0.0 \
   --normalize

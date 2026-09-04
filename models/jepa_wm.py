@@ -44,7 +44,13 @@ class RFEncoder(nn.Module):
         return self.encode_map(x, already_upsampled).mean(dim=(-2, -1))
 
 
-def _mask_for_strategy(strategy: str, batch_size: int, device: torch.device, mask_ratio: float = 0.5):
+def _mask_for_strategy(
+    strategy: str,
+    batch_size: int,
+    device: torch.device,
+    mask_ratio: float = 0.5,
+    antenna_mask_ratio_choices=None,
+):
     patch_size = PAPER_PATCH_SIZES[strategy]
     kwargs = dict(input_size=(256, 256), strategy=strategy, patch_size=patch_size)
     if strategy == "multi-block":
@@ -54,7 +60,12 @@ def _mask_for_strategy(strategy: str, batch_size: int, device: torch.device, mas
             "pred_mask_scale": (0.15, 0.2),
         })
     elif strategy == "antenna":
-        kwargs.update(mask_ratio_choices=(0.25, 0.5, 0.75))
+        # A four-antenna patch grid has only four rows.  Randomly choosing
+        # .25/.5/.75 changes the task from masking one row to masking three
+        # rows and makes validation noisy.  Ratio sweeps remain available
+        # when explicitly registered by the caller.
+        choices = antenna_mask_ratio_choices or (mask_ratio,)
+        kwargs.update(mask_ratio_choices=tuple(float(value) for value in choices))
     else:
         kwargs.update(mask_ratio=mask_ratio)
     generator = WirelessMaskGenerator(**kwargs)
@@ -63,7 +74,13 @@ def _mask_for_strategy(strategy: str, batch_size: int, device: torch.device, mas
 
 class JEPAWorldModelEncoder(nn.Module):
     """Masked latent predictor with EMA teacher and full-input RF inference."""
-    def __init__(self, latent_dim: int = 128, strategy: str = "multi-block", mask_ratio: float = 0.5):
+    def __init__(
+        self,
+        latent_dim: int = 128,
+        strategy: str = "multi-block",
+        mask_ratio: float = 0.5,
+        antenna_mask_ratio_choices=None,
+    ):
         super().__init__()
         self.context = RFEncoder(latent_dim=latent_dim)
         self.teacher = RFEncoder(latent_dim=latent_dim)
@@ -73,6 +90,9 @@ class JEPAWorldModelEncoder(nn.Module):
         )
         self.strategy = strategy
         self.mask_ratio = float(mask_ratio)
+        self.antenna_mask_ratio_choices = tuple(
+            float(value) for value in (antenna_mask_ratio_choices or (mask_ratio,))
+        )
         for p in self.teacher.parameters():
             p.requires_grad_(False)
         self.teacher.load_state_dict(self.context.state_dict())
@@ -84,7 +104,10 @@ class JEPAWorldModelEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor, strategy: Optional[str] = None):
         strategy = strategy or self.strategy
-        context_mask, target_mask = _mask_for_strategy(strategy, x.shape[0], x.device, self.mask_ratio)
+        context_mask, target_mask = _mask_for_strategy(
+            strategy, x.shape[0], x.device, self.mask_ratio,
+            antenna_mask_ratio_choices=self.antenna_mask_ratio_choices,
+        )
         x_up = upsample_iq_batch(x)
         latent_shape = self.context.encode_map(x_up, already_upsampled=True).shape[-2:]
         context_mask = resize_mask(context_mask, latent_shape)

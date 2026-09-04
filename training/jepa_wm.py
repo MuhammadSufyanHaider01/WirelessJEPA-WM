@@ -98,6 +98,25 @@ def _jepa_validation_loss(model, loader, device, strategy: str):
     return float(np.mean(values)) if values else float("nan")
 
 
+def _freeze_batchnorm_stats(module: nn.Module) -> None:
+    """Keep masked-input BN running statistics fixed during JEPA ablations.
+
+    ShuffleNet's running statistics otherwise mix full-input teacher examples
+    with zeroed context examples, which can make the small antenna/time grids
+    drift even when the representation loss is improving.
+    """
+    for submodule in module.modules():
+        if isinstance(submodule, nn.modules.batchnorm._BatchNorm):
+            submodule.eval()
+
+
+def _seed_validation_mask(epoch: int, repeat: int, seed: int) -> None:
+    value = int(seed + 10_000 + epoch * 1_000 + repeat)
+    torch.manual_seed(value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(value)
+
+
 def train_jepa(args) -> Path:
     seed_everything(args.seed)
     device = device_from(args.device)
@@ -106,7 +125,10 @@ def train_jepa(args) -> Path:
     loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, num_workers=args.workers)
     val_loader = (DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=args.workers)
                   if val_dataset is not None else None)
-    model = JEPAWorldModelEncoder(args.latent_dim, args.strategy, args.mask_ratio).to(device)
+    model = JEPAWorldModelEncoder(
+        args.latent_dim, args.strategy, args.mask_ratio,
+        antenna_mask_ratio_choices=args.antenna_ratios,
+    ).to(device)
     optimizer = torch.optim.AdamW(
         list(model.context.parameters()) + list(model.predictor.parameters()),
         lr=args.lr, weight_decay=args.weight_decay,
@@ -118,7 +140,17 @@ def train_jepa(args) -> Path:
     stale_epochs = 0
     writer = make_tensorboard_writer(Path(args.output).with_suffix(".tensorboard"))
     for epoch in range(args.epochs):
+        # A short warm-up prevents the high-variance antenna/time objectives
+        # from taking a large first step.  Multi-block retains the same
+        # optimizer and can be compared under identical settings.
+        if args.warmup_epochs > 0:
+            warmup_scale = min(1.0, float(epoch + 1) / float(args.warmup_epochs))
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr * warmup_scale
         model.train()
+        if args.freeze_bn:
+            _freeze_batchnorm_stats(model.context)
+            _freeze_batchnorm_stats(model.teacher)
         losses = []
         for batch in loader:
             x = batch.to(device, non_blocking=True)
@@ -129,13 +161,21 @@ def train_jepa(args) -> Path:
             optimizer.step()
             model.update_teacher(min(1.0, args.ema_start + (1.0 - args.ema_start) * epoch / max(args.epochs - 1, 1)))
             losses.append(float(result["loss"].detach().cpu()))
-        # Keep validation-mask draws comparable between epochs for reliable
-        # early stopping instead of comparing unrelated random masks.
-        torch.manual_seed(args.seed + 10_000 + epoch)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(args.seed + 10_000 + epoch)
-        val_loss = _jepa_validation_loss(model, val_loader, device, args.strategy)
-        row = {"epoch": epoch + 1, "loss": float(np.mean(losses)), "val_loss": val_loss, "strategy": args.strategy}
+        # Average several seeded mask draws.  A single random antenna/time
+        # mask can otherwise dominate an epoch's validation score.
+        val_values = []
+        for repeat in range(max(1, args.val_repeats)):
+            _seed_validation_mask(epoch, repeat, args.seed)
+            value = _jepa_validation_loss(model, val_loader, device, args.strategy)
+            if np.isfinite(value):
+                val_values.append(value)
+        val_loss = float(np.mean(val_values)) if val_values else float("nan")
+        row = {
+            "epoch": epoch + 1, "loss": float(np.mean(losses)),
+            "val_loss": val_loss, "strategy": args.strategy,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "val_repeats": int(len(val_values)),
+        }
         history.append(row)
         if writer:
             writer.add_scalar("jepa/loss", row["loss"], epoch + 1)
@@ -149,7 +189,10 @@ def train_jepa(args) -> Path:
             stale_epochs = 0
             save_state(out, model, {"history": history}, latent_dim=args.latent_dim, strategy=args.strategy,
                        best_epoch=best_epoch, best_val_loss=best_val, train_count=len(train_dataset),
-                       val_count=len(val_dataset) if val_dataset is not None else 0)
+                       val_count=len(val_dataset) if val_dataset is not None else 0,
+                       mask_ratio=args.mask_ratio, antenna_mask_ratio_choices=list(args.antenna_ratios),
+                       val_repeats=args.val_repeats, freeze_bn=args.freeze_bn,
+                       warmup_epochs=args.warmup_epochs, learning_rate=args.lr)
         else:
             stale_epochs += 1
         if args.patience > 0 and val_dataset is not None and stale_epochs >= args.patience:
@@ -160,7 +203,10 @@ def train_jepa(args) -> Path:
     if not out.exists():
         save_state(out, model, {"history": history}, latent_dim=args.latent_dim, strategy=args.strategy,
                    best_epoch=best_epoch, best_val_loss=best_val, train_count=len(train_dataset),
-                   val_count=len(val_dataset) if val_dataset is not None else 0)
+                   val_count=len(val_dataset) if val_dataset is not None else 0,
+                   mask_ratio=args.mask_ratio, antenna_mask_ratio_choices=list(args.antenna_ratios),
+                   val_repeats=args.val_repeats, freeze_bn=args.freeze_bn,
+                   warmup_epochs=args.warmup_epochs, learning_rate=args.lr)
     append_csv(out.with_suffix(".csv"), history)
     return out
 
@@ -195,7 +241,11 @@ def train_vae(args) -> Path:
 def _load_representation(kind: str, path: str, device: torch.device):
     payload = torch.load(path, map_location=device)
     if kind == "jepa":
-        model = JEPAWorldModelEncoder(payload.get("latent_dim", 128), payload.get("strategy", "multi-block"))
+        model = JEPAWorldModelEncoder(
+            payload.get("latent_dim", 128), payload.get("strategy", "multi-block"),
+            payload.get("mask_ratio", 0.5),
+            antenna_mask_ratio_choices=payload.get("antenna_mask_ratio_choices"),
+        )
     elif kind == "vae":
         model = RFVAE(payload.get("latent_dim", 128), payload.get("beta", 1e-3))
     else:
@@ -258,6 +308,53 @@ class ValueNet(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+class RunningValueNormalizer:
+    """Streaming normalizer for PPO value targets.
+
+    The environment reward combines rates, ages, and power penalties, so its
+    raw return scale can drift substantially over a 5,000-step episode.  A
+    running target scale keeps the critic update well-conditioned while the
+    rollout/GAE calculations continue to use returns in the environment's
+    original units.
+    """
+    def __init__(self, eps: float = 1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = float(eps)
+        self.eps = float(eps)
+
+    @torch.no_grad()
+    def update(self, values: torch.Tensor) -> None:
+        values = values.detach().float().reshape(-1)
+        if values.numel() == 0:
+            return
+        batch_mean = float(values.mean().cpu())
+        batch_var = float(values.var(unbiased=False).cpu())
+        batch_count = float(values.numel())
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / total
+        m2 = self.var * self.count + batch_var * batch_count + delta * delta * self.count * batch_count / total
+        self.mean = new_mean
+        self.var = max(m2 / total, 1e-6)
+        self.count = total
+
+    def normalize(self, values: torch.Tensor) -> torch.Tensor:
+        return (values - self.mean) / float(np.sqrt(self.var + self.eps))
+
+    def denormalize(self, values: torch.Tensor) -> torch.Tensor:
+        return values * float(np.sqrt(self.var + self.eps)) + self.mean
+
+    def state_dict(self) -> dict:
+        return {"mean": self.mean, "var": self.var, "count": self.count, "eps": self.eps}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.mean = float(state.get("mean", 0.0))
+        self.var = max(float(state.get("var", 1.0)), 1e-6)
+        self.count = max(float(state.get("count", self.eps)), self.eps)
+        self.eps = float(state.get("eps", self.eps))
+
+
 def _feature(obs, representation, side_encoder, dynamics, hidden, device, memory=True, side_only=False):
     """Encode one causal observation once and return ``(features, z)``.
 
@@ -299,13 +396,19 @@ def _gae_returns(rewards, values, terminal_flags, bootstrap, gamma, gae_lambda, 
     return torch.stack(returns), torch.stack(advantages)
 
 
-def _ppo_update(actor, critic, actor_optimizer, critic_optimizer, features, actions,
-                old_logp, returns, advantages, args):
+def _ppo_update(
+    actor, critic, actor_optimizer, critic_optimizer, features, actions,
+    old_logp, old_values, returns, advantages, args, value_normalizer,
+    entropy_coef,
+):
     """Run shuffled minibatch PPO updates for one recurrent rollout chunk."""
     count = int(features.shape[0])
     normalized_advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    normalized_returns = value_normalizer.normalize(returns)
+    normalized_old_values = value_normalizer.normalize(old_values)
     minibatch_size = max(1, min(int(args.minibatch_size), count))
     records = []
+    stop_updates = False
     for _ in range(args.ppo_epochs):
         permutation = torch.randperm(count, device=features.device)
         epoch_records = []
@@ -314,7 +417,8 @@ def _ppo_update(actor, critic, actor_optimizer, critic_optimizer, features, acti
             batch_features = features[indices]
             batch_actions = actions[indices]
             batch_old_logp = old_logp[indices]
-            batch_returns = returns[indices]
+            batch_old_values = normalized_old_values[indices]
+            batch_returns = normalized_returns[indices]
             batch_advantages = normalized_advantages[indices]
 
             new_logp = actor.log_prob(batch_features, batch_actions)
@@ -323,14 +427,19 @@ def _ppo_update(actor, critic, actor_optimizer, critic_optimizer, features, acti
             surrogate = torch.minimum(ratio * batch_advantages, clipped_ratio * batch_advantages)
             entropy = actor.entropy(batch_features).mean()
             policy_loss = -surrogate.mean()
-            actor_loss = policy_loss - args.entropy_coef * entropy
+            actor_loss = policy_loss - float(entropy_coef) * entropy
             actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
             actor_optimizer.step()
 
             value_prediction = critic(batch_features)
-            value_loss = torch.nn.functional.mse_loss(value_prediction, batch_returns)
+            value_prediction_clipped = batch_old_values + (
+                value_prediction - batch_old_values
+            ).clamp(-args.value_clip, args.value_clip)
+            value_losses = (value_prediction - batch_returns).pow(2)
+            clipped_value_losses = (value_prediction_clipped - batch_returns).pow(2)
+            value_loss = 0.5 * torch.maximum(value_losses, clipped_value_losses).mean()
             critic_optimizer.zero_grad(set_to_none=True)
             value_loss.backward()
             torch.nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
@@ -338,27 +447,85 @@ def _ppo_update(actor, critic, actor_optimizer, critic_optimizer, features, acti
 
             with torch.no_grad():
                 # Measure KL after the actor step; using ``new_logp`` here
-                # would compare the policy with itself and always report ~0.
+                # would compare the policy with itself and report ~0.
                 post_update_logp = actor.log_prob(batch_features, batch_actions)
                 log_ratio = (post_update_logp - batch_old_logp).clamp(-20.0, 20.0)
-                # A non-negative sample estimate of KL(old || new).
                 approx_kl = (torch.exp(log_ratio) - 1.0 - log_ratio).mean()
                 clip_fraction = (torch.abs(ratio - 1.0) > args.clip).float().mean()
-            epoch_records.append({
+            record = {
                 "policy_loss": float(policy_loss.detach().cpu()),
                 "value_loss": float(value_loss.detach().cpu()),
                 "entropy": float(entropy.detach().cpu()),
                 "approx_kl": float(approx_kl.cpu()),
                 "clip_fraction": float(clip_fraction.cpu()),
-            })
-        records.extend(epoch_records)
-        if args.target_kl > 0.0 and epoch_records:
-            epoch_kl = float(np.mean([record["approx_kl"] for record in epoch_records]))
-            if epoch_kl > args.target_kl:
+            }
+            epoch_records.append(record)
+            # Stop at the first minibatch that crosses the KL budget.  Waiting
+            # for a whole PPO epoch allowed late minibatches to destabilize the
+            # policy on long horizons.
+            if args.target_kl > 0.0 and record["approx_kl"] > args.target_kl:
+                stop_updates = True
                 break
+        records.extend(epoch_records)
+        if stop_updates:
+            break
     if not records:
         return {key: 0.0 for key in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction")}
     return {key: float(np.mean([record[key] for record in records])) for key in records[0]}
+
+
+@torch.no_grad()
+def _evaluate_deterministic(
+    actor, representation, side_encoder, dynamics, args, device, env_cfg,
+):
+    """Evaluate the current policy without exploration on held-out seeds."""
+    actor.eval()
+    returns = []
+    metric_rows = []
+    metric_keys = ("secrecy_gate", "success", "leakage", "age_h", "age_u", "pt_dbm", "pj_dbm")
+    for index in range(max(1, int(args.eval_episodes))):
+        env = HapUavEnv(env_cfg)
+        obs, _ = env.reset(seed=args.seed + 100_000 + index)
+        hidden = None
+        total = 0.0
+        metrics = {key: [] for key in metric_keys}
+        for _ in range(args.episode_length):
+            features, z = _feature(
+                obs, representation, side_encoder, dynamics, hidden, device,
+                args.memory, args.side_only,
+            )
+            action, _ = actor.action(features, deterministic=True)
+            next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).cpu().numpy())
+            total += float(reward)
+            for key in metric_keys:
+                if key in info:
+                    metrics[key].append(float(info[key]))
+            if args.memory:
+                hidden = dynamics(z, action, hidden).hidden
+            else:
+                hidden = None
+            obs = next_obs
+            if terminated or truncated:
+                break
+        returns.append(total)
+        metric_rows.append({
+            key: float(np.mean(values)) if values else float("nan")
+            for key, values in metrics.items()
+        })
+    actor.train()
+    result = {"eval_return": float(np.mean(returns))}
+    for key in metric_keys:
+        values = [row[key] for row in metric_rows if np.isfinite(row[key])]
+        if values:
+            result["eval_" + key] = float(np.mean(values))
+    return result
+
+
+def _entropy_coefficient(args, global_step: int) -> float:
+    total_steps = max(1, int(args.episodes * args.episode_length))
+    anneal_steps = max(1.0, total_steps * float(args.entropy_anneal_fraction))
+    progress = min(1.0, float(global_step) / anneal_steps)
+    return float(args.entropy_coef_start + (args.entropy_coef_end - args.entropy_coef_start) * progress)
 
 
 def train_ppo(args) -> Path:
@@ -389,13 +556,20 @@ def train_ppo(args) -> Path:
     critic = ValueNet(feature_dim).to(device)
     actor_optimizer = torch.optim.AdamW(actor.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=args.critic_lr, weight_decay=args.weight_decay)
+    value_normalizer = RunningValueNormalizer()
     env_cfg = HapUavConfig(max_steps=args.episode_length)
     history = []
     out = Path(args.output)
     best_path = out.with_name(out.stem + "_best" + out.suffix)
-    best_return = float("-inf")
+    best_eval_return = float("-inf")
+    best_stochastic_return = float("-inf")
     writer = make_tensorboard_writer(out.with_suffix(".tensorboard"))
     metric_keys = ("age_h", "age_u", "secrecy_rate", "secrecy_gate", "mu_h", "mu_u", "pt_dbm", "pj_dbm")
+
+    # Retain compatibility with callers that supplied the old fixed entropy
+    # argument; a scheduled coefficient is the new default.
+    if getattr(args, "entropy_coef", None) is not None:
+        args.entropy_coef_start = float(args.entropy_coef)
 
     for episode in range(args.episodes):
         env = HapUavEnv(env_cfg)
@@ -424,7 +598,7 @@ def train_ppo(args) -> Path:
                 )
                 with torch.no_grad():
                     action, logp = actor.action(current_features)
-                    value = critic(current_features)
+                    value = value_normalizer.denormalize(critic(current_features))
                 next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).cpu().numpy())
                 for key in metric_keys:
                     if key in info:
@@ -462,14 +636,17 @@ def train_ppo(args) -> Path:
                         obs, representation, side_encoder, dynamics, hidden, device,
                         args.memory, args.side_only,
                     )
-                    bootstrap = critic(next_features).squeeze(0)
+                    bootstrap = value_normalizer.denormalize(critic(next_features)).squeeze(0)
                 returns_t, advantages_t = _gae_returns(
                     rewards_t, values_t, terminal_flags, bootstrap,
                     args.gamma, args.gae_lambda, args.reward_scale,
                 )
+            value_normalizer.update(returns_t)
+            entropy_coef = _entropy_coefficient(args, episode * args.episode_length + episode_steps)
             update_records.append(_ppo_update(
                 actor, critic, actor_optimizer, critic_optimizer,
-                features_t, actions_t, old_logp_t, returns_t, advantages_t, args,
+                features_t, actions_t, old_logp_t, values_t,
+                returns_t, advantages_t, args, value_normalizer, entropy_coef,
             ))
 
         row = {
@@ -483,39 +660,56 @@ def train_ppo(args) -> Path:
             "entropy": float(np.mean([record["entropy"] for record in update_records])),
             "approx_kl": float(np.mean([record["approx_kl"] for record in update_records])),
             "clip_fraction": float(np.mean([record["clip_fraction"] for record in update_records])),
+            "entropy_coef": float(_entropy_coefficient(args, episode * args.episode_length + episode_steps)),
             "log_std_pt": float(actor.log_std[0].clamp(args.min_log_std, args.max_log_std).detach().cpu()),
             "log_std_pj": float(actor.log_std[1].clamp(args.min_log_std, args.max_log_std).detach().cpu()),
+            "value_target_mean": float(value_normalizer.mean),
+            "value_target_std": float(np.sqrt(value_normalizer.var)),
         }
         for key, values_for_key in episode_metrics.items():
             if values_for_key:
                 row[key] = float(np.mean(values_for_key))
+
+        should_eval = ((episode + 1) % max(1, args.eval_interval) == 0 or episode == args.episodes - 1)
+        if should_eval:
+            row.update(_evaluate_deterministic(
+                actor, representation, side_encoder, dynamics, args, device, env_cfg,
+            ))
         history.append(row)
         if writer:
             for key, value in row.items():
                 if key not in {"episode"} and np.isfinite(value):
                     writer.add_scalar("ppo/" + key, value, episode + 1)
             writer.flush()
-        if episode_return > best_return:
-            best_return = episode_return
+        best_stochastic_return = max(best_stochastic_return, episode_return)
+        eval_return = row.get("eval_return", float("nan"))
+        if np.isfinite(eval_return) and eval_return > best_eval_return:
+            best_eval_return = float(eval_return)
             save_state(
-                best_path, actor, {"history": history, "best_return": best_return},
+                best_path, actor, {"history": history, "best_eval_return": best_eval_return,
+                                  "best_stochastic_return": best_stochastic_return,
+                                  "best_return": best_stochastic_return},
                 critic=critic.state_dict(), representation=args.representation,
                 memory=args.memory, side_only=args.side_only, actor_hidden=args.actor_hidden,
                 feature_dim=feature_dim, episode_length=args.episode_length,
                 rollout_steps=args.rollout_steps, min_log_std=args.min_log_std,
-                max_log_std=args.max_log_std,
+                max_log_std=args.max_log_std, value_normalizer=value_normalizer.state_dict(),
+                entropy_coef_start=args.entropy_coef_start, entropy_coef_end=args.entropy_coef_end,
             )
         print(json.dumps(row), flush=True)
 
     if writer:
         writer.close()
     save_state(
-        out, actor, {"history": history, "best_return": best_return},
+        out, actor, {"history": history, "best_eval_return": best_eval_return,
+                     "best_stochastic_return": best_stochastic_return,
+                     "best_return": best_stochastic_return},
         critic=critic.state_dict(), representation=args.representation,
         memory=args.memory, side_only=args.side_only, actor_hidden=args.actor_hidden,
         feature_dim=feature_dim, episode_length=args.episode_length,
         rollout_steps=args.rollout_steps, min_log_std=args.min_log_std,
-        max_log_std=args.max_log_std,
+        max_log_std=args.max_log_std, value_normalizer=value_normalizer.state_dict(),
+        entropy_coef_start=args.entropy_coef_start, entropy_coef_end=args.entropy_coef_end,
     )
     append_csv(out.with_suffix(".csv"), history)
     return out
@@ -525,10 +719,10 @@ def build_parser():
     sub = parser.add_subparsers(dest="stage", required=True)
     def common(p):
         p.add_argument("--data", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--epochs", type=int, default=1); p.add_argument("--batch-size", type=int, default=8); p.add_argument("--workers", type=int, default=0); p.add_argument("--lr", type=float, default=1e-3); p.add_argument("--weight-decay", type=float, default=1e-4)
-    p = sub.add_parser("jepa"); common(p); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--strategy", default="multi-block", choices=("random", "antenna", "time", "multi-block")); p.add_argument("--mask-ratio", type=float, default=.5); p.add_argument("--ema-start", type=float, default=.996); p.add_argument("--val-fraction", type=float, default=.1); p.add_argument("--patience", type=int, default=10, help="epochs without validation improvement before stopping; 0 disables"); p.add_argument("--min-delta", type=float, default=0.0); p.add_argument("--normalize", action="store_true", help="per-window max-magnitude normalization"); p.set_defaults(func=train_jepa)
+    p = sub.add_parser("jepa"); common(p); p.set_defaults(lr=3e-4); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--strategy", default="multi-block", choices=("random", "antenna", "time", "multi-block")); p.add_argument("--mask-ratio", type=float, default=.5); p.add_argument("--antenna-ratios", type=float, nargs="+", default=[.5], help="explicit antenna mask ratios; use .25 .5 .75 only for a registered ratio-sweep ablation"); p.add_argument("--ema-start", type=float, default=.996); p.add_argument("--val-fraction", type=float, default=.1); p.add_argument("--patience", type=int, default=20, help="epochs without validation improvement before stopping; 0 disables"); p.add_argument("--min-delta", type=float, default=0.0); p.add_argument("--val-repeats", type=int, default=4, help="seeded validation mask passes averaged per epoch"); p.add_argument("--warmup-epochs", type=int, default=5); p.add_argument("--train-bn", dest="freeze_bn", action="store_false", help="allow masked-input BatchNorm running statistics to update"); p.set_defaults(freeze_bn=True); p.add_argument("--normalize", action="store_true", help="per-window max-magnitude normalization"); p.set_defaults(func=train_jepa)
     p = sub.add_parser("vae"); common(p); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--beta", type=float, default=1e-3); p.set_defaults(func=train_vae)
     p = sub.add_parser("mdn"); common(p); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--hidden-dim", type=int, default=256); p.add_argument("--mixtures", type=int, default=5); p.add_argument("--kpi-weight", type=float, default=.1); p.set_defaults(func=train_mdn)
-    p = sub.add_parser("ppo"); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--dynamics-checkpoint", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--episodes", type=int, default=500); p.add_argument("--episode-length", type=int, default=5000); p.add_argument("--rollout-steps", type=int, default=512, help="transitions per recurrent PPO update; does not shorten the episode"); p.add_argument("--minibatch-size", type=int, default=256); p.add_argument("--actor-hidden", type=int, default=128); p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--critic-lr", type=float, default=1e-3); p.add_argument("--weight-decay", type=float, default=0.0); p.add_argument("--gamma", type=float, default=.99); p.add_argument("--gae-lambda", type=float, default=.95); p.add_argument("--clip", type=float, default=.2); p.add_argument("--ppo-epochs", type=int, default=4); p.add_argument("--entropy-coef", type=float, default=.01); p.add_argument("--target-kl", type=float, default=.03); p.add_argument("--max-grad-norm", type=float, default=.5); p.add_argument("--reward-scale", type=float, default=1.0); p.add_argument("--initial-log-std", type=float, default=.7); p.add_argument("--min-log-std", type=float, default=-2.5); p.add_argument("--max-log-std", type=float, default=1.0); p.add_argument("--memory", action="store_true"); p.add_argument("--side-only", action="store_true"); p.set_defaults(func=train_ppo)
+    p = sub.add_parser("ppo"); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--dynamics-checkpoint", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--episodes", type=int, default=500); p.add_argument("--episode-length", type=int, default=5000); p.add_argument("--rollout-steps", type=int, default=512, help="transitions per recurrent PPO update; does not shorten the episode"); p.add_argument("--minibatch-size", type=int, default=256); p.add_argument("--actor-hidden", type=int, default=128); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--critic-lr", type=float, default=5e-4); p.add_argument("--weight-decay", type=float, default=0.0); p.add_argument("--gamma", type=float, default=.99); p.add_argument("--gae-lambda", type=float, default=.95); p.add_argument("--clip", type=float, default=.2); p.add_argument("--value-clip", type=float, default=.2); p.add_argument("--ppo-epochs", type=int, default=4); p.add_argument("--entropy-coef", type=float, default=None, help="legacy fixed coefficient; overrides entropy-coef-start when supplied"); p.add_argument("--entropy-coef-start", type=float, default=.01); p.add_argument("--entropy-coef-end", type=float, default=0.0); p.add_argument("--entropy-anneal-fraction", type=float, default=.30); p.add_argument("--target-kl", type=float, default=.015); p.add_argument("--max-grad-norm", type=float, default=.5); p.add_argument("--reward-scale", type=float, default=1.0); p.add_argument("--initial-log-std", type=float, default=.7); p.add_argument("--min-log-std", type=float, default=-2.5); p.add_argument("--max-log-std", type=float, default=.7); p.add_argument("--eval-interval", type=int, default=25); p.add_argument("--eval-episodes", type=int, default=3); p.add_argument("--memory", action="store_true"); p.add_argument("--side-only", action="store_true"); p.set_defaults(func=train_ppo)
     return parser
 
 

@@ -9,7 +9,7 @@ from data.hap_uav import PilotWindowDataset, TrajectoryDataset, generate_expert_
 from environment.hap_uav import HapUavConfig, HapUavEnv, dbm_to_watts, watts_to_dbm
 from evaluation.hap_uav_eval import genie_action
 from models.jepa_wm import ActionConditionedMDNLSTM, JEPAWorldModelEncoder, LatentStateEncoder, PowerController, RFVAE
-from training.jepa_wm import _gae_returns, _split_pilot_dataset
+from training.jepa_wm import RunningValueNormalizer, _gae_returns, _split_pilot_dataset
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -80,6 +80,19 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(controller.entropy(features)).all())
         self.assertLessEqual(float(controller.distribution(features).scale.max()), float(torch.exp(torch.tensor(.5))) + 1e-6)
         self.assertTrue(torch.all((action >= 0) & (action <= 1)))
+
+    def test_value_normalizer_round_trip(self):
+        normalizer = RunningValueNormalizer()
+        values = torch.tensor([-4.0, 0.0, 8.0])
+        normalizer.update(values)
+        normalized = normalizer.normalize(values)
+        restored = normalizer.denormalize(normalized)
+        self.assertTrue(torch.allclose(restored, values, atol=1e-5))
+        self.assertTrue(torch.isfinite(normalized).all())
+
+    def test_antenna_mask_ratio_is_explicit(self):
+        model = JEPAWorldModelEncoder(strategy="antenna", antenna_mask_ratio_choices=(.5,))
+        self.assertEqual(model.antenna_mask_ratio_choices, (.5,))
 
     def test_model_interfaces_and_gradients(self):
         x = torch.randn(1, 2, 4, 256)
