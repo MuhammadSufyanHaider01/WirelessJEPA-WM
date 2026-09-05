@@ -37,13 +37,25 @@ case "${STRATEGY}" in
   *) echo "Unsupported JEPA strategy ${STRATEGY}" >&2; exit 2 ;;
 esac
 DEFAULT_STEM="${STRATEGY//-/_}"
-OUTPUT="${JEPA_WM_OUTPUT:-${PWD}/artifacts/jepa_wm_v1/checkpoints/jepa_${DEFAULT_STEM}_gpu_v2.pt}"
+OUTPUT="${JEPA_WM_OUTPUT:-${PWD}/artifacts/jepa_wm_v1/checkpoints/jepa_${DEFAULT_STEM}_gpu_v3.pt}"
 EPOCHS="${JEPA_WM_EPOCHS:-100}"
-PATIENCE="${JEPA_WM_PATIENCE:-20}"
-LR="${JEPA_WM_LR:-3e-4}"
-VAL_REPEATS="${JEPA_WM_VAL_REPEATS:-4}"
-WARMUP_EPOCHS="${JEPA_WM_WARMUP_EPOCHS:-5}"
-ANTENNA_RATIOS="${JEPA_WM_ANTENNA_RATIOS:-0.5}"
+PATIENCE="${JEPA_WM_PATIENCE:-30}"
+LR="${JEPA_WM_LR:-1e-4}"
+VAL_REPEATS="${JEPA_WM_VAL_REPEATS:-8}"
+WARMUP_EPOCHS="${JEPA_WM_WARMUP_EPOCHS:-10}"
+FINAL_LR_RATIO="${JEPA_WM_FINAL_LR_RATIO:-0.1}"
+GRAD_CLIP="${JEPA_WM_GRAD_CLIP:-1.0}"
+MIN_DELTA="${JEPA_WM_MIN_DELTA:-0.0001}"
+EMA_START="${JEPA_WM_EMA_START:-0.999}"
+EMA_END="${JEPA_WM_EMA_END:-0.9999}"
+ANTENNA_RATIOS="${JEPA_WM_ANTENNA_RATIOS:-0.25}"
+if [[ -n "${JEPA_WM_MASK_RATIO:-}" ]]; then
+  MASK_RATIO="${JEPA_WM_MASK_RATIO}"
+elif [[ "${STRATEGY}" == "multi-block" ]]; then
+  MASK_RATIO="0.5"
+else
+  MASK_RATIO="0.25"
+fi
 BATCH_SIZE="${JEPA_WM_BATCH_SIZE:-64}"
 WORKERS="${JEPA_WM_WORKERS:-4}"
 mkdir -p "$(dirname "${OUTPUT}")"
@@ -70,12 +82,16 @@ srun python3 -u training/jepa_wm.py jepa \
   --batch-size "${BATCH_SIZE}" \
   --workers "${WORKERS}" \
   --strategy "${STRATEGY}" \
-  --mask-ratio 0.5 \
+  --mask-ratio "${MASK_RATIO}" \
   --antenna-ratios ${ANTENNA_RATIOS} \
   --lr "${LR}" \
+  --ema-start "${EMA_START}" \
+  --ema-end "${EMA_END}" \
+  --final-lr-ratio "${FINAL_LR_RATIO}" \
+  --grad-clip "${GRAD_CLIP}" \
   --val-fraction 0.10 \
   --val-repeats "${VAL_REPEATS}" \
   --warmup-epochs "${WARMUP_EPOCHS}" \
   --patience "${PATIENCE}" \
-  --min-delta 0.0 \
+  --min-delta "${MIN_DELTA}" \
   --normalize

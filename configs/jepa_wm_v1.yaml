@@ -6,13 +6,19 @@ representation:
   mask_ratio: 0.5
   epochs: 100
   batch_size: 64
-  lr: 0.0003
-  ema_start: 0.996
-  patience: 20
-  val_repeats: 4
-  warmup_epochs: 5
+  lr: 0.0001
+  ema_start: 0.999
+  ema_end: 0.9999
+  patience: 30
+  min_delta: 0.0001
+  val_repeats: 8
+  warmup_epochs: 10
+  final_lr_ratio: 0.1
+  grad_clip: 1.0
   freeze_bn: true
-  antenna_ratios: [0.5]
+  freeze_bn_affine: true
+  mask_ratio_ablation: 0.25
+  antenna_ratios: [0.25]
 vae:
   latent_dim: 128
   beta: 0.001

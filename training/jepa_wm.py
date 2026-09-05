@@ -98,16 +98,40 @@ def _jepa_validation_loss(model, loader, device, strategy: str):
     return float(np.mean(values)) if values else float("nan")
 
 
-def _freeze_batchnorm_stats(module: nn.Module) -> None:
-    """Keep masked-input BN running statistics fixed during JEPA ablations.
+def _freeze_batchnorm_stats(module: nn.Module, freeze_affine: bool = False) -> None:
+    """Keep masked-input BN statistics (and optionally affine weights) fixed.
 
     ShuffleNet's running statistics otherwise mix full-input teacher examples
-    with zeroed context examples, which can make the small antenna/time grids
-    drift even when the representation loss is improving.
+    with zeroed context examples.  The affine parameters are also frozen for
+    the sparse-mask ablations by default; ``--train-bn-affine`` remains an
+    explicit opt-out for later capacity studies.
     """
     for submodule in module.modules():
         if isinstance(submodule, nn.modules.batchnorm._BatchNorm):
             submodule.eval()
+            if freeze_affine:
+                if submodule.weight is not None:
+                    submodule.weight.requires_grad_(False)
+                if submodule.bias is not None:
+                    submodule.bias.requires_grad_(False)
+
+
+def _scheduled_jepa_lr(args, epoch: int) -> float:
+    """Linear warm-up followed by cosine decay to a non-zero floor."""
+    warmup = max(0, int(args.warmup_epochs))
+    if warmup and epoch < warmup:
+        return float(args.lr) * float(epoch + 1) / float(warmup)
+    decay_steps = max(1, int(args.epochs) - warmup - 1)
+    progress = min(1.0, max(0.0, float(epoch - warmup) / float(decay_steps)))
+    cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+    floor = float(args.final_lr_ratio)
+    return float(args.lr) * (floor + (1.0 - floor) * cosine)
+
+
+def _scheduled_ema_momentum(args, epoch: int) -> float:
+    """Cosine EMA schedule that never freezes the teacher at exactly one."""
+    progress = min(1.0, max(0.0, float(epoch) / float(max(int(args.epochs) - 1, 1))))
+    return float(args.ema_start + (args.ema_end - args.ema_start) * (0.5 - 0.5 * np.cos(np.pi * progress)))
 
 
 def _seed_validation_mask(epoch: int, repeat: int, seed: int) -> None:
@@ -140,27 +164,27 @@ def train_jepa(args) -> Path:
     stale_epochs = 0
     writer = make_tensorboard_writer(Path(args.output).with_suffix(".tensorboard"))
     for epoch in range(args.epochs):
-        # A short warm-up prevents the high-variance antenna/time objectives
-        # from taking a large first step.  Multi-block retains the same
-        # optimizer and can be compared under identical settings.
-        if args.warmup_epochs > 0:
-            warmup_scale = min(1.0, float(epoch + 1) / float(args.warmup_epochs))
-            for group in optimizer.param_groups:
-                group["lr"] = args.lr * warmup_scale
+        # A longer warm-up plus cosine decay prevents the sparse-mask losses
+        # from drifting as soon as the optimizer reaches its peak rate.
+        current_lr = _scheduled_jepa_lr(args, epoch)
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
         model.train()
         if args.freeze_bn:
-            _freeze_batchnorm_stats(model.context)
-            _freeze_batchnorm_stats(model.teacher)
+            _freeze_batchnorm_stats(model.context, args.freeze_bn_affine)
+            _freeze_batchnorm_stats(model.teacher, args.freeze_bn_affine)
         losses = []
+        grad_norms = []
         for batch in loader:
             x = batch.to(device, non_blocking=True)
             result = model(x, strategy=args.strategy)
             optimizer.zero_grad(set_to_none=True)
             result["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
-            model.update_teacher(min(1.0, args.ema_start + (1.0 - args.ema_start) * epoch / max(args.epochs - 1, 1)))
+            model.update_teacher(_scheduled_ema_momentum(args, epoch))
             losses.append(float(result["loss"].detach().cpu()))
+            grad_norms.append(float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm))
         # Average several seeded mask draws.  A single random antenna/time
         # mask can otherwise dominate an epoch's validation score.
         val_values = []
@@ -174,6 +198,8 @@ def train_jepa(args) -> Path:
             "epoch": epoch + 1, "loss": float(np.mean(losses)),
             "val_loss": val_loss, "strategy": args.strategy,
             "lr": float(optimizer.param_groups[0]["lr"]),
+            "ema_momentum": float(_scheduled_ema_momentum(args, epoch)),
+            "grad_norm": float(np.mean(grad_norms)) if grad_norms else 0.0,
             "val_repeats": int(len(val_values)),
         }
         history.append(row)
@@ -192,7 +218,9 @@ def train_jepa(args) -> Path:
                        val_count=len(val_dataset) if val_dataset is not None else 0,
                        mask_ratio=args.mask_ratio, antenna_mask_ratio_choices=list(args.antenna_ratios),
                        val_repeats=args.val_repeats, freeze_bn=args.freeze_bn,
-                       warmup_epochs=args.warmup_epochs, learning_rate=args.lr)
+                       freeze_bn_affine=args.freeze_bn_affine, warmup_epochs=args.warmup_epochs,
+                       final_lr_ratio=args.final_lr_ratio, grad_clip=args.grad_clip,
+                       ema_start=args.ema_start, ema_end=args.ema_end, learning_rate=args.lr)
         else:
             stale_epochs += 1
         if args.patience > 0 and val_dataset is not None and stale_epochs >= args.patience:
@@ -206,7 +234,9 @@ def train_jepa(args) -> Path:
                    val_count=len(val_dataset) if val_dataset is not None else 0,
                    mask_ratio=args.mask_ratio, antenna_mask_ratio_choices=list(args.antenna_ratios),
                    val_repeats=args.val_repeats, freeze_bn=args.freeze_bn,
-                   warmup_epochs=args.warmup_epochs, learning_rate=args.lr)
+                   freeze_bn_affine=args.freeze_bn_affine, warmup_epochs=args.warmup_epochs,
+                   final_lr_ratio=args.final_lr_ratio, grad_clip=args.grad_clip,
+                   ema_start=args.ema_start, ema_end=args.ema_end, learning_rate=args.lr)
     append_csv(out.with_suffix(".csv"), history)
     return out
 
@@ -719,7 +749,7 @@ def build_parser():
     sub = parser.add_subparsers(dest="stage", required=True)
     def common(p):
         p.add_argument("--data", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--epochs", type=int, default=1); p.add_argument("--batch-size", type=int, default=8); p.add_argument("--workers", type=int, default=0); p.add_argument("--lr", type=float, default=1e-3); p.add_argument("--weight-decay", type=float, default=1e-4)
-    p = sub.add_parser("jepa"); common(p); p.set_defaults(lr=3e-4); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--strategy", default="multi-block", choices=("random", "antenna", "time", "multi-block")); p.add_argument("--mask-ratio", type=float, default=.5); p.add_argument("--antenna-ratios", type=float, nargs="+", default=[.5], help="explicit antenna mask ratios; use .25 .5 .75 only for a registered ratio-sweep ablation"); p.add_argument("--ema-start", type=float, default=.996); p.add_argument("--val-fraction", type=float, default=.1); p.add_argument("--patience", type=int, default=20, help="epochs without validation improvement before stopping; 0 disables"); p.add_argument("--min-delta", type=float, default=0.0); p.add_argument("--val-repeats", type=int, default=4, help="seeded validation mask passes averaged per epoch"); p.add_argument("--warmup-epochs", type=int, default=5); p.add_argument("--train-bn", dest="freeze_bn", action="store_false", help="allow masked-input BatchNorm running statistics to update"); p.set_defaults(freeze_bn=True); p.add_argument("--normalize", action="store_true", help="per-window max-magnitude normalization"); p.set_defaults(func=train_jepa)
+    p = sub.add_parser("jepa"); common(p); p.set_defaults(lr=1e-4); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--strategy", default="multi-block", choices=("random", "antenna", "time", "multi-block")); p.add_argument("--mask-ratio", type=float, default=.5); p.add_argument("--antenna-ratios", type=float, nargs="+", default=[.25], help="explicit antenna mask ratios; use .25 .5 .75 only for a registered ratio-sweep ablation"); p.add_argument("--ema-start", type=float, default=.999); p.add_argument("--ema-end", type=float, default=.9999); p.add_argument("--val-fraction", type=float, default=.1); p.add_argument("--patience", type=int, default=30, help="epochs without validation improvement before stopping; 0 disables"); p.add_argument("--min-delta", type=float, default=1e-4); p.add_argument("--val-repeats", type=int, default=8, help="seeded validation mask passes averaged per epoch"); p.add_argument("--warmup-epochs", type=int, default=10); p.add_argument("--final-lr-ratio", type=float, default=.1); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--train-bn", dest="freeze_bn", action="store_false", help="allow masked-input BatchNorm running statistics to update"); p.add_argument("--train-bn-affine", dest="freeze_bn_affine", action="store_false", help="allow BatchNorm affine parameters to update"); p.set_defaults(freeze_bn=True, freeze_bn_affine=True); p.add_argument("--normalize", action="store_true", help="per-window max-magnitude normalization"); p.set_defaults(func=train_jepa)
     p = sub.add_parser("vae"); common(p); p.add_argument("--latent-dim", type=int, default=128); p.add_argument("--beta", type=float, default=1e-3); p.set_defaults(func=train_vae)
     p = sub.add_parser("mdn"); common(p); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--hidden-dim", type=int, default=256); p.add_argument("--mixtures", type=int, default=5); p.add_argument("--kpi-weight", type=float, default=.1); p.set_defaults(func=train_mdn)
     p = sub.add_parser("ppo"); p.add_argument("--representation", choices=("jepa", "vae"), required=True); p.add_argument("--representation-checkpoint", required=True); p.add_argument("--dynamics-checkpoint", required=True); p.add_argument("--output", required=True); p.add_argument("--device", default="auto"); p.add_argument("--seed", type=int, default=42); p.add_argument("--episodes", type=int, default=500); p.add_argument("--episode-length", type=int, default=5000); p.add_argument("--rollout-steps", type=int, default=512, help="transitions per recurrent PPO update; does not shorten the episode"); p.add_argument("--minibatch-size", type=int, default=256); p.add_argument("--actor-hidden", type=int, default=128); p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--critic-lr", type=float, default=5e-4); p.add_argument("--weight-decay", type=float, default=0.0); p.add_argument("--gamma", type=float, default=.99); p.add_argument("--gae-lambda", type=float, default=.95); p.add_argument("--clip", type=float, default=.2); p.add_argument("--value-clip", type=float, default=.2); p.add_argument("--ppo-epochs", type=int, default=4); p.add_argument("--entropy-coef", type=float, default=None, help="legacy fixed coefficient; overrides entropy-coef-start when supplied"); p.add_argument("--entropy-coef-start", type=float, default=.01); p.add_argument("--entropy-coef-end", type=float, default=0.0); p.add_argument("--entropy-anneal-fraction", type=float, default=.30); p.add_argument("--target-kl", type=float, default=.015); p.add_argument("--max-grad-norm", type=float, default=.5); p.add_argument("--reward-scale", type=float, default=1.0); p.add_argument("--initial-log-std", type=float, default=.7); p.add_argument("--min-log-std", type=float, default=-2.5); p.add_argument("--max-log-std", type=float, default=.7); p.add_argument("--eval-interval", type=int, default=25); p.add_argument("--eval-episodes", type=int, default=3); p.add_argument("--memory", action="store_true"); p.add_argument("--side-only", action="store_true"); p.set_defaults(func=train_ppo)
