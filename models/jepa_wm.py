@@ -14,8 +14,10 @@ from pretrain.iqfm_masks import WirelessMaskGenerator, PAPER_PATCH_SIZES, resize
 try:
     import timm
     import models.shufflenet_tv_in_timm  # registers the torchvision-compatible model
+    import models.sparse_encoder as sparse_encoder
 except Exception:  # pragma: no cover - optional for light unit tests
     timm = None
+    sparse_encoder = None
 
 
 def upsample_iq_batch(x: torch.Tensor) -> torch.Tensor:
@@ -26,23 +28,121 @@ def upsample_iq_batch(x: torch.Tensor) -> torch.Tensor:
 
 
 class RFEncoder(nn.Module):
-    """Dense inference wrapper around the existing ShuffleNet RF backbone."""
-    def __init__(self, latent_dim: int = 128, backbone_name: str = "shufflenet_v2_x0_5_torchvision"):
+    """Dense or sparse-inference wrapper around the ShuffleNet RF backbone."""
+    def __init__(
+        self,
+        latent_dim: int = 128,
+        backbone_name: str = "shufflenet_v2_x0_5_torchvision",
+        sparse: bool = False,
+    ):
         super().__init__()
         if timm is None:
             raise ImportError("timm is required for RFEncoder")
-        self.backbone = timm.create_model(backbone_name, pretrained=False, num_classes=0, global_pool="")
+        backbone = timm.create_model(backbone_name, pretrained=False, num_classes=0, global_pool="")
+        self.sparse = bool(sparse)
+        if self.sparse:
+            if sparse_encoder is None:
+                raise ImportError("sparse encoder utilities are required for sparse RFEncoder")
+            backbone = sparse_encoder.dense_model_to_sparse(backbone)
+        self.backbone = backbone
         self.projection = nn.Conv2d(self.backbone.num_features, latent_dim, kernel_size=1)
         self.latent_dim = int(latent_dim)
+        # ShuffleNet feature maps are downsampled by 32. Sparse masks must
+        # live at the lowest feature-map resolution so every sparse stage can
+        # expand them by an integer factor.
+        self.sparse_mask_stride = 32
 
-    def encode_map(self, x: torch.Tensor, already_upsampled: bool = False) -> torch.Tensor:
+    def encode_map(
+        self,
+        x: torch.Tensor,
+        already_upsampled: bool = False,
+        active_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         image = x if already_upsampled else upsample_iq_batch(x)
+        if self.sparse:
+            if active_mask is None:
+                active_mask = torch.ones(
+                    image.shape[0], 1,
+                    max(1, image.shape[-2] // self.sparse_mask_stride),
+                    max(1, image.shape[-1] // self.sparse_mask_stride),
+                    dtype=torch.bool, device=image.device,
+                )
+            elif tuple(active_mask.shape[-2:]) == tuple(image.shape[-2:]):
+                # Convert an optional pixel-space mask to the sparse base grid.
+                kernel = self.sparse_mask_stride
+                active_mask = F.max_pool2d(
+                    active_mask.to(dtype=torch.float32),
+                    kernel_size=kernel, stride=kernel,
+                ).to(dtype=torch.bool)
+            sparse_encoder._cur_active = active_mask.to(
+                device=image.device, dtype=torch.bool
+            )
         fmap = self.backbone(image)
         return self.projection(fmap)
 
     def forward(self, x: torch.Tensor, already_upsampled: bool = False) -> torch.Tensor:
         return self.encode_map(x, already_upsampled).mean(dim=(-2, -1))
 
+
+class MaskedSpatialPredictor(nn.Module):
+    """WirelessJEPA-style spatial predictor with depthwise 3x3 blocks."""
+    def __init__(self, channels: int, layers: int = 3):
+        super().__init__()
+        blocks = []
+        for _ in range(int(layers)):
+            blocks.extend([
+                nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+                nn.Conv2d(channels, channels, 1, bias=False),
+                # GroupNorm has identical behavior in train/eval mode; this
+                # avoids a predictor-statistics mismatch during frozen
+                # representation validation and downstream inference.
+                nn.GroupNorm(1, channels),
+                nn.ReLU(inplace=True),
+            ])
+        self.net = nn.Sequential(*blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def _masked_feature_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_mask: torch.Tensor,
+    mode: str = "normalized",
+):
+    """Compute target-only JEPA loss and return collapse diagnostics."""
+    if mode == "normalized":
+        # Per-token normalization prevents a near-zero predictor/teacher pair
+        # from winning raw MSE merely by shrinking all RF features.
+        prediction_for_loss = F.normalize(prediction, dim=1, eps=1e-6)
+        target_for_loss = F.normalize(target.detach(), dim=1, eps=1e-6)
+    elif mode == "centered":
+        prediction_for_loss = prediction - prediction.mean(dim=1, keepdim=True)
+        target_for_loss = target.detach() - target.detach().mean(dim=1, keepdim=True)
+        prediction_for_loss = F.normalize(prediction_for_loss, dim=1, eps=1e-6)
+        target_for_loss = F.normalize(target_for_loss, dim=1, eps=1e-6)
+    elif mode == "raw":
+        prediction_for_loss, target_for_loss = prediction, target.detach()
+    else:
+        raise ValueError(f"Unknown JEPA feature loss mode {mode!r}")
+    mask = target_mask.to(prediction_for_loss.dtype)
+    per_location = (prediction_for_loss - target_for_loss).pow(2).sum(dim=1, keepdim=True)
+    loss = (per_location * mask).sum() / mask.sum().clamp_min(1.0)
+    with torch.no_grad():
+        target_std = target.detach().flatten(2).std(dim=-1, unbiased=False).mean()
+        prediction_std = prediction.detach().flatten(2).std(dim=-1, unbiased=False).mean()
+        target_norm = target.detach().flatten(2).norm(dim=1).mean()
+        prediction_norm = prediction.detach().flatten(2).norm(dim=1).mean()
+        cosine = F.cosine_similarity(prediction.detach(), target.detach(), dim=1, eps=1e-6).mean()
+    diagnostics = {
+        "target_std": target_std,
+        "prediction_std": prediction_std,
+        "target_norm": target_norm,
+        "prediction_norm": prediction_norm,
+        "cosine": cosine,
+    }
+    return loss, diagnostics
 
 def _mask_for_strategy(
     strategy: str,
@@ -80,14 +180,27 @@ class JEPAWorldModelEncoder(nn.Module):
         strategy: str = "multi-block",
         mask_ratio: float = 0.5,
         antenna_mask_ratio_choices=None,
+        predictor_variant: str = "original",
+        sparse_context: bool = True,
+        feature_loss: str = "normalized",
     ):
         super().__init__()
-        self.context = RFEncoder(latent_dim=latent_dim)
-        self.teacher = RFEncoder(latent_dim=latent_dim)
-        self.predictor = nn.Sequential(
-            nn.Conv2d(latent_dim, latent_dim, 1), nn.GELU(),
-            nn.Conv2d(latent_dim, latent_dim, 1),
-        )
+        self.predictor_variant = str(predictor_variant)
+        self.sparse_context = bool(sparse_context)
+        self.feature_loss = str(feature_loss)
+        self.context = RFEncoder(latent_dim=latent_dim, sparse=self.sparse_context)
+        self.teacher = RFEncoder(latent_dim=latent_dim, sparse=False)
+        if self.predictor_variant == "legacy":
+            self.predictor = nn.Sequential(
+                nn.Conv2d(latent_dim, latent_dim, 1), nn.GELU(),
+                nn.Conv2d(latent_dim, latent_dim, 1),
+            )
+        elif self.predictor_variant == "original":
+            self.predictor = MaskedSpatialPredictor(latent_dim, layers=3)
+            self.mask_token = nn.Parameter(torch.zeros(1, latent_dim, 1, 1))
+            nn.init.normal_(self.mask_token, mean=0.0, std=0.02)
+        else:
+            raise ValueError(f"Unknown predictor variant {predictor_variant!r}")
         self.strategy = strategy
         self.mask_ratio = float(mask_ratio)
         self.antenna_mask_ratio_choices = tuple(
@@ -109,20 +222,36 @@ class JEPAWorldModelEncoder(nn.Module):
             antenna_mask_ratio_choices=self.antenna_mask_ratio_choices,
         )
         x_up = upsample_iq_batch(x)
-        latent_shape = self.context.encode_map(x_up, already_upsampled=True).shape[-2:]
-        context_mask = resize_mask(context_mask, latent_shape)
-        target_mask = resize_mask(target_mask, latent_shape)
-        # Match the target mask to the input grid; zeroing the context is the
-        # dense equivalent of the sparse context encoder used by WirelessJEPA.
-        input_mask = resize_mask(context_mask, x_up.shape[-2:]).to(x_up.dtype)
-        context_map = self.context.encode_map(x_up * input_mask, already_upsampled=True)
-        prediction_map = self.predictor(context_map)
         with torch.no_grad():
             target_map = self.teacher.encode_map(x_up, already_upsampled=True)
-        mask = target_mask.to(prediction_map.dtype)
-        loss = ((prediction_map - target_map).pow(2).sum(dim=1, keepdim=True) * mask).sum() / mask.sum().clamp_min(1.0)
-        return {"loss": loss, "prediction": prediction_map, "target": target_map,
-                "context_mask": context_mask, "target_mask": target_mask}
+        latent_shape = target_map.shape[-2:]
+        context_mask = resize_mask(context_mask, latent_shape)
+        target_mask = resize_mask(target_mask, latent_shape)
+        input_mask = resize_mask(context_mask, x_up.shape[-2:]).to(x_up.dtype)
+        if self.sparse_context:
+            context_map = self.context.encode_map(
+                x_up * input_mask, already_upsampled=True, active_mask=context_mask,
+            )
+        else:
+            context_map = self.context.encode_map(x_up * input_mask, already_upsampled=True)
+        if self.predictor_variant == "original":
+            # Explicit mask tokens tell the predictor which latent positions
+            # are missing; masked zeros alone are ambiguous in I/Q signals.
+            predictor_input = torch.where(
+                context_mask.expand_as(context_map), context_map,
+                self.mask_token.to(dtype=context_map.dtype),
+            )
+        else:
+            predictor_input = context_map
+        prediction_map = self.predictor(predictor_input)
+        loss, diagnostics = _masked_feature_loss(
+            prediction_map, target_map, target_mask, mode=self.feature_loss,
+        )
+        return {
+            "loss": loss, "prediction": prediction_map, "target": target_map,
+            "context_mask": context_mask, "target_mask": target_mask,
+            **diagnostics,
+        }
 
     @torch.no_grad()
     def encode_rf(self, x: torch.Tensor) -> torch.Tensor:

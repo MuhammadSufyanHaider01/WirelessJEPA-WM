@@ -37,16 +37,16 @@ case "${STRATEGY}" in
   *) echo "Unsupported JEPA strategy ${STRATEGY}" >&2; exit 2 ;;
 esac
 DEFAULT_STEM="${STRATEGY//-/_}"
-OUTPUT="${JEPA_WM_OUTPUT:-${PWD}/artifacts/jepa_wm_v1/checkpoints/jepa_${DEFAULT_STEM}_gpu_v3.pt}"
+OUTPUT="${JEPA_WM_OUTPUT:-${PWD}/artifacts/jepa_wm_v1/checkpoints/jepa_${DEFAULT_STEM}_gpu_v4.pt}"
 EPOCHS="${JEPA_WM_EPOCHS:-100}"
 PATIENCE="${JEPA_WM_PATIENCE:-30}"
-LR="${JEPA_WM_LR:-1e-4}"
+LR="${JEPA_WM_LR:-3e-5}"
 VAL_REPEATS="${JEPA_WM_VAL_REPEATS:-8}"
-WARMUP_EPOCHS="${JEPA_WM_WARMUP_EPOCHS:-10}"
+WARMUP_EPOCHS="${JEPA_WM_WARMUP_EPOCHS:-3}"
 FINAL_LR_RATIO="${JEPA_WM_FINAL_LR_RATIO:-0.1}"
 GRAD_CLIP="${JEPA_WM_GRAD_CLIP:-1.0}"
 MIN_DELTA="${JEPA_WM_MIN_DELTA:-0.0001}"
-EMA_START="${JEPA_WM_EMA_START:-0.999}"
+EMA_START="${JEPA_WM_EMA_START:-0.9999}"
 EMA_END="${JEPA_WM_EMA_END:-0.9999}"
 ANTENNA_RATIOS="${JEPA_WM_ANTENNA_RATIOS:-0.25}"
 if [[ -n "${JEPA_WM_MASK_RATIO:-}" ]]; then
@@ -56,9 +56,15 @@ elif [[ "${STRATEGY}" == "multi-block" ]]; then
 else
   MASK_RATIO="0.25"
 fi
+MASK_RATIO_START="${JEPA_WM_MASK_RATIO_START:-}"
+MASK_CURRICULUM_EPOCHS="${JEPA_WM_MASK_CURRICULUM_EPOCHS:-0}"
 BATCH_SIZE="${JEPA_WM_BATCH_SIZE:-64}"
 WORKERS="${JEPA_WM_WORKERS:-4}"
 mkdir -p "$(dirname "${OUTPUT}")"
+CURRICULUM_ARGS=(--mask-curriculum-epochs "${MASK_CURRICULUM_EPOCHS}")
+if [[ -n "${MASK_RATIO_START}" ]]; then
+  CURRICULUM_ARGS+=(--mask-ratio-start "${MASK_RATIO_START}")
+fi
 
 # Fail early if the node GPU is not supported by this PyTorch build.
 python3 - <<'PY'
@@ -83,6 +89,7 @@ srun python3 -u training/jepa_wm.py jepa \
   --workers "${WORKERS}" \
   --strategy "${STRATEGY}" \
   --mask-ratio "${MASK_RATIO}" \
+  "${CURRICULUM_ARGS[@]}" \
   --antenna-ratios ${ANTENNA_RATIOS} \
   --lr "${LR}" \
   --ema-start "${EMA_START}" \
@@ -94,4 +101,7 @@ srun python3 -u training/jepa_wm.py jepa \
   --warmup-epochs "${WARMUP_EPOCHS}" \
   --patience "${PATIENCE}" \
   --min-delta "${MIN_DELTA}" \
+  --predictor-variant original \
+  --feature-loss normalized \
+  --min-feature-std 1e-4 \
   --normalize

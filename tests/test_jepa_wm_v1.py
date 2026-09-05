@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,7 @@ from data.hap_uav import PilotWindowDataset, TrajectoryDataset, generate_expert_
 from environment.hap_uav import HapUavConfig, HapUavEnv, dbm_to_watts, watts_to_dbm
 from evaluation.hap_uav_eval import genie_action
 from models.jepa_wm import ActionConditionedMDNLSTM, JEPAWorldModelEncoder, LatentStateEncoder, PowerController, RFVAE
-from training.jepa_wm import RunningValueNormalizer, _gae_returns, _split_pilot_dataset
+from training.jepa_wm import RunningValueNormalizer, _gae_returns, _jepa_parameter_groups, _scheduled_mask_ratio, _split_pilot_dataset
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -94,10 +95,24 @@ class ModelTests(unittest.TestCase):
         model = JEPAWorldModelEncoder(strategy="antenna", antenna_mask_ratio_choices=(.5,))
         self.assertEqual(model.antenna_mask_ratio_choices, (.5,))
 
+    def test_mask_curriculum_preserves_physical_antenna_choices(self):
+        args = SimpleNamespace(mask_ratio=.5, mask_ratio_start=.25, mask_curriculum_epochs=4, strategy="random")
+        self.assertAlmostEqual(_scheduled_mask_ratio(args, 0), .3125)
+        self.assertAlmostEqual(_scheduled_mask_ratio(args, 3), .5)
+        args.strategy = "antenna"
+        self.assertAlmostEqual(_scheduled_mask_ratio(args, 0), .5)
+
     def test_model_interfaces_and_gradients(self):
         x = torch.randn(1, 2, 4, 256)
         jepa = JEPAWorldModelEncoder(); result = jepa(x)
         self.assertEqual(tuple(jepa.encode_rf(x).shape), (1, 128)); self.assertTrue(torch.isfinite(result["loss"]))
+        for key in ("target_std", "prediction_std", "target_norm", "prediction_norm", "cosine"):
+            self.assertIn(key, result); self.assertTrue(torch.isfinite(result[key]))
+        groups = _jepa_parameter_groups(jepa, 1e-4)
+        grouped = {id(parameter) for group in groups for parameter in group["params"]}
+        optimized = {id(parameter) for parameter in list(jepa.context.parameters()) + list(jepa.predictor.parameters()) + [jepa.mask_token]}
+        self.assertEqual(grouped, optimized)
+        self.assertTrue(any(group["weight_decay"] == 0.0 for group in groups))
         result["loss"].backward()
         vae = RFVAE(); vae_loss, _ = vae.loss(x); self.assertTrue(torch.isfinite(vae_loss)); vae_loss.backward()
         state = torch.randn(2, 4, 160); action = torch.rand(2, 4, 2)
